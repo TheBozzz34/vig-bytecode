@@ -42,6 +42,8 @@ pub const OpCode = enum(u8) {
     rotl = 34,
     add_wrap = 35,
     read_i32 = 36,
+    read_byte = 37,
+    print_hex = 38,
 
     /// Decode an opcode byte. The function gives an error for a byte that has
     /// no instruction. It does not ignore that byte.
@@ -176,6 +178,8 @@ pub const table = [_]Info{
     .{ .code = .rotl, .mnemonic = "rotl", .operand = .none, .stack_effect = "a b → rotate_left(a, b mod 32)", .summary = "Rotate left by the low five bits of the rotation count." },
     .{ .code = .add_wrap, .mnemonic = "add_wrap", .operand = .none, .stack_effect = "a b → a +% b", .summary = "Add two values and wrap modulo 2^32." },
     .{ .code = .read_i32, .mnemonic = "read_i32", .operand = .none, .stack_effect = "→ value", .summary = "Read a signed decimal integer from the input stream." },
+    .{ .code = .read_byte, .mnemonic = "read_byte", .operand = .none, .stack_effect = "→ byte", .summary = "Read one input byte, or push -1 at end of input." },
+    .{ .code = .print_hex, .mnemonic = "print_hex", .operand = .none, .stack_effect = "a → a", .summary = "Print the top value as eight hexadecimal digits without removing it." },
 };
 
 // The opcode byte is the index into `table`. Therefore the table must describe
