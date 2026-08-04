@@ -33,6 +33,15 @@ pub const OpCode = enum(u8) {
     print_string = 25,
     load_at = 26,
     store_at = 27,
+    @"and" = 28,
+    @"or" = 29,
+    xor = 30,
+    not = 31,
+    shl = 32,
+    shr_u = 33,
+    rotl = 34,
+    add_wrap = 35,
+    read_i32 = 36,
 
     /// Decode an opcode byte. The function gives an error for a byte that has
     /// no instruction. It does not ignore that byte.
@@ -158,6 +167,15 @@ pub const table = [_]Info{
     .{ .code = .print_string, .mnemonic = "print_string", .operand = .none, .stack_effect = "address → address", .summary = "Print the NUL-terminated string at a program address." },
     .{ .code = .load_at, .mnemonic = "load_at", .operand = .none, .stack_effect = "address → data[address]", .summary = "Push a data-segment value, using an address from the stack." },
     .{ .code = .store_at, .mnemonic = "store_at", .operand = .none, .stack_effect = "value address →", .summary = "Pop a value into the data segment, using an address from the stack." },
+    .{ .code = .@"and", .mnemonic = "and", .operand = .none, .stack_effect = "a b → a & b", .summary = "Compute the bitwise AND of two values." },
+    .{ .code = .@"or", .mnemonic = "or", .operand = .none, .stack_effect = "a b → a | b", .summary = "Compute the bitwise OR of two values." },
+    .{ .code = .xor, .mnemonic = "xor", .operand = .none, .stack_effect = "a b → a ^ b", .summary = "Compute the bitwise XOR of two values." },
+    .{ .code = .not, .mnemonic = "not", .operand = .none, .stack_effect = "a → ~a", .summary = "Invert every bit of a value." },
+    .{ .code = .shl, .mnemonic = "shl", .operand = .none, .stack_effect = "a b → a << (b mod 32)", .summary = "Shift left by the low five bits of the shift count." },
+    .{ .code = .shr_u, .mnemonic = "shr_u", .operand = .none, .stack_effect = "a b → unsigned(a) >> (b mod 32)", .summary = "Shift right logically by the low five bits of the shift count." },
+    .{ .code = .rotl, .mnemonic = "rotl", .operand = .none, .stack_effect = "a b → rotate_left(a, b mod 32)", .summary = "Rotate left by the low five bits of the rotation count." },
+    .{ .code = .add_wrap, .mnemonic = "add_wrap", .operand = .none, .stack_effect = "a b → a +% b", .summary = "Add two values and wrap modulo 2^32." },
+    .{ .code = .read_i32, .mnemonic = "read_i32", .operand = .none, .stack_effect = "→ value", .summary = "Read a signed decimal integer from the input stream." },
 };
 
 // The opcode byte is the index into `table`. Therefore the table must describe
