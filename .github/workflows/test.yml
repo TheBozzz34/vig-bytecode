@@ -1,0 +1,33 @@
+# The shared package: the instruction set, the container format and the verifier.
+# It has no dependency of its own, so this workflow builds it on its own.
+#
+# The assembler and the VM both import this package. A change here can break
+# either of them without breaking any test in this repository. Their own
+# workflows check the two other repositories against this one.
+name: test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          # This value must be the `minimum_zig_version` of build.zig.zon. A
+          # development build is removed from the Zig download site after some
+          # time. Therefore this pin can stop resolving, and the fix is to move
+          # both this line and that field to a newer build.
+          version: 0.17.0-dev.1543+6db520a4c
+
+      - run: zig build test --summary all
