@@ -1,6 +1,6 @@
 # vig-bytecode
 
-Definitions for the VIG [assembler](https://github.com/TheBozzz34/vig-assemblerr) and [VM](https://github.com/TheBozzz34/vig). Ibncludes
+Definitions for the VIG [assembler](https://github.com/TheBozzz34/vig-assemblerr) and [VM](https://github.com/TheBozzz34/vig). Includes
 the instruction set, foreign-call ABI limits, container format, and
 the verifier.
 
