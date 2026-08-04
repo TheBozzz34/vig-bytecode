@@ -29,7 +29,7 @@ pub const OpCode = enum(u8) {
     store = 21,
     call = 22,
     ret = 23,
-    foreign_call = 24,
+    foreign_call = 24, // ffi
     print_string = 25,
     load_at = 26,
     store_at = 27,
@@ -46,14 +46,7 @@ pub const OpCode = enum(u8) {
     print_hex = 38,
     write_byte = 39,
 
-    // Byte-addressed access to guest memory. Each of these takes its address from
-    // the stack, and that address is a byte offset into the memory of the VM: the
-    // code region, then the static data, then the space above the program image.
-    //
-    // A narrow load must say whether it extends the sign of the value it read,
-    // because the stack holds an i32. C needs both forms: `char` and `signed char`
-    // extend, `unsigned char` does not. One instruction could not serve the two.
-    // A store needs no such pair, because it writes the low bits either way.
+    // Byte-addressed access to guest memory
     load8_u = 40,
     load8_s = 41,
     load16_u = 42,
