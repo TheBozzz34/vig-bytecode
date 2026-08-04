@@ -1,8 +1,9 @@
-//! Instruction encoding and decoding.
+//! How to encode an instruction and how to decode it.
 //!
-//! One place knows how an instruction becomes bytes and how bytes become an
-//! instruction again, so the assembler's emitter and the VM's verifier cannot
-//! disagree about operand widths or signedness.
+//! This one module holds the rules that change an instruction into bytes. It
+//! also holds the rules that change those bytes into an instruction again.
+//! Therefore the output stage of the assembler and the verifier of the VM cannot
+//! disagree about the width or the sign of an operand.
 
 const std = @import("std");
 const opcode = @import("opcode.zig");
@@ -12,15 +13,16 @@ const OperandKind = opcode.OperandKind;
 
 pub const Error = error{
     UnknownOpcode,
-    /// The instruction's operand runs past the end of the code region.
+    /// The operand of the instruction continues past the end of the code
+    /// region.
     TruncatedInstruction,
-    /// The supplied operand does not match the opcode's operand kind.
+    /// The given operand is not the operand kind of the opcode.
     OperandKindMismatch,
     BufferTooSmall,
 };
 
-/// A decoded operand. The tags mirror `OperandKind`, which is what lets
-/// `encode` reject an operand the opcode cannot carry.
+/// A decoded operand. The tags are the same as the values of `OperandKind`.
+/// Therefore `encode` can find an operand that the opcode cannot hold.
 pub const Operand = union(enum) {
     none,
     signed: i32,
@@ -42,18 +44,20 @@ pub const Operand = union(enum) {
 pub const Instruction = struct {
     code: OpCode,
     operand: Operand,
-    /// Offset of the opcode byte within the code region it was decoded from.
+    /// The offset of the opcode byte in the code region that supplied it.
     offset: usize,
-    /// Encoded length in bytes, including the opcode byte.
+    /// The length of the instruction in bytes. This length includes the opcode
+    /// byte.
     size: usize,
 
-    /// Offset just past this instruction: where execution continues when the
-    /// instruction falls through.
+    /// The offset of the first byte after this instruction. Execution continues
+    /// at this offset if the instruction does not move control.
     pub fn end(self: Instruction) usize {
         return self.offset + self.size;
     }
 
-    /// The absolute code offset this instruction transfers control to, if any.
+    /// The absolute code offset that this instruction moves control to. The
+    /// result is null if the instruction does not move control.
     pub fn codeTarget(self: Instruction) ?u32 {
         return switch (self.operand) {
             .code_target => |target| target,
@@ -85,7 +89,8 @@ pub fn decode(code: []const u8, offset: usize) Error!Instruction {
     };
 }
 
-/// Encode one instruction at the start of `dest`, returning the bytes written.
+/// Encode one instruction at the start of `dest`. The function gives the number
+/// of bytes that it wrote.
 pub fn encode(dest: []u8, code: OpCode, operand: Operand) Error!usize {
     if (operand.kind() != code.operandKind()) return error.OperandKindMismatch;
 
@@ -155,7 +160,7 @@ test "decoding rejects unknown opcodes and truncated operands" {
     try testing.expectError(error.UnknownOpcode, decode(&[_]u8{0xfe}, 0));
     try testing.expectError(error.TruncatedInstruction, decode(&[_]u8{}, 0));
     try testing.expectError(error.TruncatedInstruction, decode(&[_]u8{ 0, 0 }, 2));
-    // `push` needs four operand bytes, and only three follow.
+    // `push` needs four operand bytes. Only three bytes come after it.
     try testing.expectError(error.TruncatedInstruction, decode(&[_]u8{ 1, 0, 0, 0 }, 0));
     try testing.expectError(
         error.TruncatedInstruction,
@@ -167,7 +172,7 @@ test "encoding rejects an operand the opcode cannot carry" {
     var buffer: [8]u8 = undefined;
     try testing.expectError(error.OperandKindMismatch, encode(&buffer, .halt, .{ .signed = 1 }));
     try testing.expectError(error.OperandKindMismatch, encode(&buffer, .push, .none));
-    // `jmp` takes a code offset; a data address is a different kind of operand.
+    // `jmp` takes a code offset. A data address is a different kind of operand.
     try testing.expectError(error.OperandKindMismatch, encode(&buffer, .jmp, .{ .data_address = 4 }));
     try testing.expectError(error.BufferTooSmall, encode(buffer[0..3], .push, .{ .signed = 1 }));
 }

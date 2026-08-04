@@ -1,7 +1,7 @@
-//! The VIG container format: the on-disk wrapper around a program image.
+//! The VIG container format: the file that holds a program image.
 //!
-//! Format version 2 records the shape of the program explicitly instead of
-//! leaving it implicit in the file length:
+//! Format version 2 records the shape of the program in the header. Version 1
+//! left that shape implicit in the length of the file.
 //!
 //! ```text
 //! offset size field
@@ -19,26 +19,29 @@
 //!            static data
 //! ```
 //!
-//! Splitting code from static data is what makes instruction-boundary
-//! verification possible: strings live outside the executable region, so a
-//! verifier can walk the code region without tripping over text, and jumps can
-//! be required to land on an instruction. The import-table length lets a reader
-//! find the code without decoding imports, and the version and flags fields let
-//! a reader reject a container it does not fully understand instead of guessing.
+//! The split of the code from the static data makes it possible to check the
+//! instruction boundaries. A string is outside the executable region.
+//! Therefore a verifier can read the code region and no text stops it, and each
+//! jump must go to an instruction. The import-table length lets a reader find
+//! the code without a decode of the imports. The version field and the flags
+//! field let a reader refuse a container that it does not fully understand. The
+//! reader does not try to read such a container.
 //!
-//! Version 1 containers (a six-byte prefix followed by an import table and a
-//! mixed code-and-data blob) and bare headerless code are still readable, so
-//! programs assembled before this format existed keep running. They carry no
-//! code/data split, so they cannot be verified.
+//! A version 1 container has a six-byte prefix, then an import table, then one
+//! region with both the code and the data in it. This package can still read a
+//! version 1 container and bare code with no header. Therefore a program from
+//! before the current format continues to run. These two forms have no split of
+//! the code from the data, and no verifier can check them.
 
 const std = @import("std");
 const foreign = @import("foreign.zig");
 
 pub const magic = "VIGF";
 
-/// Format version this package writes.
+/// The format version that this package writes.
 pub const version: u8 = 2;
-/// Earlier format: magic, version, import count, then imports and one blob.
+/// The earlier format: the magic, the version and the import count. Then come
+/// the imports and one region that holds both the code and the data.
 pub const legacy_version: u8 = 1;
 
 pub const header_size = 24;
@@ -66,9 +69,10 @@ pub const Error = error{
     BufferTooSmall,
 };
 
-/// Container-wide flags. Every bit is reserved in format version 2, and a reader
-/// rejects any that are set: a future flag has to be understood to be honoured,
-/// so an older VM must refuse the container rather than ignore the bit.
+/// The flags for the complete container. Format version 2 reserves each bit. A
+/// reader refuses a container if a bit is set. A VM must understand a new flag
+/// before it can use the flag. Therefore an older VM must refuse the container.
+/// It must not ignore the bit.
 pub const Flags = packed struct(u8) {
     reserved: u8 = 0,
 
@@ -93,35 +97,39 @@ pub const Header = struct {
     import_table_len: u32 = 0,
 };
 
-/// How a file described its contents.
+/// How a file gives the shape of its contents.
 pub const Kind = enum {
-    /// No magic: the whole file is code, as the very first VIG programs were.
+    /// No magic bytes. The complete file is code, as in the first VIG programs.
     raw,
-    /// Format version 1: an import table followed by code and data in one blob.
+    /// Format version 1: an import table, then the code and the data in one
+    /// region.
     legacy,
-    /// Format version 2, the layout documented at the top of this file.
+    /// Format version 2. The top of this file gives the layout.
     current,
 
-    /// Whether the container distinguishes code from static data, which a
-    /// verifier needs in order to know where instructions stop.
+    /// This function is true if the container keeps the code apart from the
+    /// static data. A verifier needs this split to find where the instructions
+    /// stop.
     pub fn separatesData(self: Kind) bool {
         return self == .current;
     }
 };
 
-/// A parsed container: the header plus borrowed slices into the source bytes.
+/// A container after a parse: the header and slices into the source bytes. The
+/// image does not own these slices.
 pub const Image = struct {
     kind: Kind,
     header: Header,
-    /// Encoded import table; walk it with `importIterator`.
+    /// The encoded import table. Use `importIterator` to read the entries.
     imports: []const u8,
-    /// Executable instructions. Nothing outside this range is ever executed.
+    /// The executable instructions. The VM executes no byte outside this range.
     code: []const u8,
-    /// Static data mapped immediately after the code, so an address pushed by a
-    /// program indexes `code ++ data`. Always empty for `raw` and `legacy`.
+    /// The static data. The VM puts it in memory directly after the code.
+    /// Therefore an address from a program is an index into `code ++ data`. This
+    /// field is always empty for a `raw` image and a `legacy` image.
     data: []const u8,
 
-    /// Bytes the program occupies in VM memory.
+    /// The number of bytes that the program uses in VM memory.
     pub fn imageLen(self: Image) usize {
         return self.code.len + self.data.len;
     }
@@ -135,8 +143,9 @@ pub fn isContainer(bytes: []const u8) bool {
     return bytes.len >= magic.len and std.mem.eql(u8, bytes[0..magic.len], magic);
 }
 
-/// Largest valid file for a VM whose program image is at most `image_size`
-/// bytes: the header, the largest possible import table, and the image.
+/// The largest correct file for a VM that has a program image of `image_size`
+/// bytes or less. The total is the header, the largest possible import table and
+/// the image.
 pub fn maxFileSize(image_size: usize) usize {
     return header_size + foreign.max_table_size + image_size;
 }
@@ -153,8 +162,8 @@ pub fn writeHeader(header: Header, dest: *[header_size]u8) void {
     std.mem.writeInt(u32, dest[offset_import_table_len..][0..4], header.import_table_len, .little);
 }
 
-/// Read a format-version-2 header. Field consistency against the rest of the
-/// file is checked by `parse`.
+/// Read a header in format version 2. `parse` checks the fields against the
+/// remainder of the file.
 pub fn readHeader(bytes: []const u8) Error!Header {
     if (!isContainer(bytes) or bytes.len < header_size) return error.InvalidContainerHeader;
     if (bytes[offset_version] != version) return error.UnsupportedContainerVersion;
@@ -174,7 +183,7 @@ pub fn readHeader(bytes: []const u8) Error!Header {
     };
 }
 
-/// Parse any container this package can read, current or legacy.
+/// Parse a container that this package can read, current or legacy.
 pub fn parse(bytes: []const u8) Error!Image {
     if (!isContainer(bytes)) {
         return .{
@@ -192,13 +201,15 @@ pub fn parse(bytes: []const u8) Error!Image {
     const declared = @as(u64, header_size) + header.import_table_len + header.code_len + header.data_len;
     if (declared != bytes.len) return error.ContainerSizeMismatch;
 
-    // Safe now that the declared lengths are known to sum to the file size.
+    // The declared lengths add up to the size of the file. Therefore these
+    // offsets are safe.
     const code_start = header_size + @as(usize, header.import_table_len);
     const code_end = code_start + @as(usize, header.code_len);
 
     const imports = bytes[header_size..code_start];
-    // A table that does not decode to exactly `import_count` entries filling
-    // `import_table_len` bytes means the header and the table disagree.
+    // The table must decode to exactly `import_count` entries, and these
+    // entries must fill `import_table_len` bytes. If they do not, the header and
+    // the table disagree.
     if (try importTableSize(imports, header.import_count) != imports.len) {
         return error.ContainerSizeMismatch;
     }
@@ -232,8 +243,9 @@ fn parseLegacy(bytes: []const u8) Error!Image {
             .import_table_len = @intCast(table_len),
         },
         .imports = rest[0..table_len],
-        // Version 1 mixed strings into the code blob, so everything after the
-        // import table has to stay executable and addressable.
+        // Version 1 put a string in the same region as the code. Therefore all
+        // the bytes after the import table must stay executable, and a program
+        // must be able to address them.
         .code = rest[table_len..],
         .data = &.{},
     };
@@ -251,7 +263,7 @@ fn checkEntryPoint(entry_point: u32, code_len: usize) Error!void {
     if (entry_point >= code_len) return error.EntryPointOutOfRange;
 }
 
-/// Bytes the first `count` import entries occupy.
+/// The number of bytes that the first `count` import entries use.
 pub fn importTableSize(bytes: []const u8, count: u8) Error!usize {
     var iterator: ImportIterator = .{ .bytes = bytes, .remaining = count };
     while (try iterator.next()) |_| {}
@@ -292,8 +304,9 @@ pub const ImportIterator = struct {
     }
 };
 
-/// What `write` should lay out. `code` and `data` are already-assembled regions;
-/// addresses inside the program treat them as one contiguous image.
+/// The data for `write`. `code` and `data` are regions that the assembler made
+/// before. An address in the program refers to the two regions as one continuous
+/// image.
 pub const Layout = struct {
     imports: []const foreign.Import = &.{},
     code: []const u8,
@@ -302,12 +315,13 @@ pub const Layout = struct {
     flags: Flags = .{},
 };
 
-/// Exact file size `write` will produce for `layout`.
+/// The exact size of the file that `write` makes for `layout`.
 pub fn encodedSize(layout: Layout) Error!usize {
     return header_size + try importTableLen(layout.imports) + layout.code.len + layout.data.len;
 }
 
-/// Write a complete container into `dest`, returning the bytes written.
+/// Write a complete container into `dest`. The function gives the number of
+/// bytes that it wrote.
 pub fn write(layout: Layout, dest: []u8) Error!usize {
     const table_len = try importTableLen(layout.imports);
     try checkEntryPoint(layout.entry_point, layout.code.len);
@@ -429,7 +443,7 @@ test "headerless bytes parse as a raw code image" {
 }
 
 test "version 1 containers still parse, with code and data in one region" {
-    // Magic, version 1, one import, then `lstrlenA` and two code bytes.
+    // The magic, version 1, one import, then `lstrlenA` and two code bytes.
     const bytes = "VIGF" ++ [_]u8{ 1, 1, 12, 8, 1, @intFromEnum(foreign.ArgType.cstr) } ++
         "kernel32.dlllstrlenA" ++ [_]u8{ 24, 0 };
 
@@ -454,8 +468,8 @@ test "a truncated version 1 import table is rejected" {
 
 test "unreadable containers are rejected rather than guessed at" {
     var buffer: [header_size]u8 = undefined;
-    // A header describing an empty program: valid on its own, so each mutation
-    // below is the only reason its container is rejected.
+    // This header describes an empty program. The header is correct, so each
+    // change below is the only reason for a refusal of its container.
     writeHeader(.{}, &buffer);
     const good = buffer;
 
@@ -466,22 +480,22 @@ test "unreadable containers are rejected rather than guessed at" {
     buffer[offset_version] = 3;
     try testing.expectError(error.UnsupportedContainerVersion, parse(&buffer));
 
-    // A flag bit this version does not define.
+    // A flag bit that this version does not define.
     buffer = good;
     buffer[offset_flags] = 1;
     try testing.expectError(error.UnsupportedContainerFlags, parse(&buffer));
 
-    // Reserved bytes must be zero so they stay available.
+    // A reserved byte must be zero. Then it stays available for later use.
     buffer = good;
     buffer[offset_reserved] = 1;
     try testing.expectError(error.InvalidContainerHeader, parse(&buffer));
 
-    // More imports than the ABI allows.
+    // More imports than the ABI permits.
     buffer = good;
     buffer[offset_import_count] = foreign.max_imports + 1;
     try testing.expectError(error.TooManyForeignImports, parse(&buffer));
 
-    // Lengths that do not add up to the file size.
+    // Lengths that do not add up to the size of the file.
     buffer = good;
     std.mem.writeInt(u32, buffer[offset_code_len..][0..4], 99, .little);
     try testing.expectError(error.ContainerSizeMismatch, parse(&buffer));
@@ -494,7 +508,7 @@ test "unreadable containers are rejected rather than guessed at" {
 }
 
 test "an import table shorter than its declared length is rejected" {
-    // Declare one import but leave the table empty.
+    // Declare one import, but keep the table empty.
     var buffer: [header_size]u8 = undefined;
     writeHeader(.{ .import_count = 1 }, &buffer);
     try testing.expectError(error.InvalidContainerHeader, parse(&buffer));
@@ -502,7 +516,7 @@ test "an import table shorter than its declared length is rejected" {
 
 test "writing rejects layouts the format cannot express" {
     var buffer: [header_size + 8]u8 = undefined;
-    // An entry point has to name an instruction in the code region.
+    // An entry point must name an instruction in the code region.
     try testing.expectError(error.EntryPointOutOfRange, write(.{ .code = "", .entry_point = 1 }, &buffer));
     try testing.expectError(
         error.EntryPointOutOfRange,

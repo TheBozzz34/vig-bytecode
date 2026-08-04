@@ -1,23 +1,27 @@
-//! Bytecode verifier.
+//! The bytecode verifier.
 //!
-//! The verifier walks a container's code region from its entry point, following
-//! every branch, and proves that:
+//! The verifier reads the code region of a container. It starts at the entry
+//! point and goes to each branch target. It then makes sure that:
 //!
-//! - every reachable byte sequence decodes to a known instruction that fits
-//!   inside the code region;
-//! - every jump and call target lands on an instruction boundary rather than in
-//!   the middle of one, so no path can execute an operand as an opcode;
-//! - control never falls off the end of the code region;
-//! - every `foreign_call` names an import the container actually declares, and
-//!   `load`/`store` stay inside the data segment when its size is known.
+//! - each byte sequence that the program can reach decodes to a known
+//!   instruction, and that instruction is inside the code region;
+//! - each jump target and each call target is at the first byte of an
+//!   instruction, and not inside an instruction. Therefore no path can execute
+//!   an operand byte as an opcode;
+//! - control does not continue past the end of the code region;
+//! - each `foreign_call` names an import that the container declares. Also,
+//!   `load` and `store` stay inside the data segment if the caller gives the
+//!   size of that segment.
 //!
-//! This is only practical because format version 2 records the code length
-//! separately from static data: a walk over a region with strings mixed in would
-//! decode text as instructions. Version 1 containers therefore cannot be
-//! verified, and are still executed with runtime checks alone.
+//! These checks are possible only because format version 2 records the code
+//! length apart from the static data. A read of a region that also holds strings
+//! decodes text as instructions. Therefore no verifier can check a version 1
+//! container. The VM runs such a container with the run-time checks only.
 //!
-//! The walk is reachability-based, not a linear sweep, so unreachable bytes are
-//! ignored rather than reported. They are never executed.
+//! The verifier looks only at the bytes that the program can reach. It does not
+//! do a linear read of the region. Therefore the verifier ignores a byte that
+//! the program cannot reach, and it does not report that byte. The VM never
+//! executes such a byte.
 
 const std = @import("std");
 const encode = @import("encode.zig");
@@ -27,55 +31,59 @@ pub const Error = error{
     UnknownOpcode,
     TruncatedInstruction,
     EntryPointOutOfRange,
-    /// A jump or call target lies outside the code region.
+    /// A jump target or a call target is outside the code region.
     TargetOutOfRange,
-    /// A jump or call target lies inside another instruction.
+    /// A jump target or a call target is inside a different instruction.
     MisalignedTarget,
-    /// Two reachable instructions claim the same bytes.
+    /// Two instructions that the program can reach use the same bytes.
     OverlappingInstruction,
-    /// A reachable instruction falls through past the end of the code region.
+    /// After an instruction, control continues past the end of the code region.
     ExecutionRunsOffEnd,
     UnknownForeignImport,
     DataAddressOutOfRange,
     ScratchTooSmall,
 };
 
-/// What the walk has established about one byte of the code region.
+/// What the verifier knows about one byte of the code region.
 pub const Mark = enum(u8) {
     unknown,
-    /// Reachable and waiting to be decoded.
+    /// The program can reach this byte. The verifier must still decode it.
     pending,
-    /// The first byte of a reachable instruction.
+    /// The first byte of an instruction that the program can reach.
     boundary,
-    /// An operand byte of a reachable instruction.
+    /// An operand byte of an instruction that the program can reach.
     interior,
 };
 
 pub const Options = struct {
     code: []const u8,
     entry_point: u32 = 0,
-    /// Imports the container declares; `foreign_call` indices must be below it.
+    /// The number of imports that the container declares. Each `foreign_call`
+    /// index must be less than this number.
     import_count: u8 = 0,
-    /// Slots in the VM data segment. `null` skips `load`/`store` address checks,
-    /// for callers that do not fix the segment size.
+    /// The number of slots in the VM data segment. A `null` value stops the
+    /// address checks on `load` and `store`. Use `null` if the caller does not
+    /// set the size of the segment.
     data_slots: ?u32 = null,
 };
 
-/// Where verification failed, for diagnostics. `offset` is the instruction that
-/// was rejected, not necessarily the byte the problem is at.
+/// The location of a failure, for a diagnostic message. `offset` is the
+/// instruction that the verifier refused. The problem can be at a different
+/// byte.
 pub const Failure = struct {
     offset: usize,
     reason: Error,
 };
 
-/// Scratch bytes `verify` needs for a code region of `code_len` bytes.
+/// The number of temporary marks that `verify` needs for a code region of
+/// `code_len` bytes.
 pub fn scratchSize(code_len: usize) usize {
     return code_len;
 }
 
-/// Verify `options.code`. `scratch` must hold at least `scratchSize(code.len)`
-/// marks; it is fully overwritten. `failure`, when supplied, receives the
-/// location of the first problem found.
+/// Verify `options.code`. `scratch` must hold `scratchSize(code.len)` marks or
+/// more, and `verify` writes over all of it. If the caller gives a `failure`
+/// value, `verify` puts the location of the first problem into it.
 pub fn verify(options: Options, scratch: []Mark, failure: ?*Failure) Error!void {
     const code = options.code;
     if (scratch.len < scratchSize(code.len)) return fail(failure, 0, error.ScratchTooSmall);
@@ -104,8 +112,9 @@ pub fn verify(options: Options, scratch: []Mark, failure: ?*Failure) Error!void 
 
         marks[offset] = .boundary;
         for (marks[offset + 1 .. instruction.end()]) |*mark| {
-            // Another reachable path starts an instruction inside this one, so
-            // one of the two decodes an operand byte as an opcode.
+            // A different path that the program can reach starts an
+            // instruction inside this instruction. Therefore one of the
+            // two decodes an operand byte as an opcode.
             if (mark.* != .unknown and mark.* != .interior) {
                 return fail(failure, offset, error.OverlappingInstruction);
             }
@@ -145,7 +154,8 @@ fn schedule(marks: []Mark, target: u32, offset: usize, failure: ?*Failure, hint:
     }
 }
 
-/// Next byte waiting to be decoded, searching from `from` and wrapping once.
+/// The next byte that the verifier must decode. The search starts at `from`. It
+/// then continues one time from the start of the region.
 fn findPending(marks: []const Mark, from: usize) ?usize {
     for (marks[from..], from..) |mark, offset| {
         if (mark == .pending) return offset;
@@ -166,8 +176,8 @@ fn fail(failure: ?*Failure, offset: usize, reason: Error) Error {
 const testing = std.testing;
 const OpCode = opcode.OpCode;
 
-/// Builds a code region and hands back each instruction's offset, so tests can
-/// name branch targets instead of counting bytes.
+/// This structure makes a code region. It gives the offset of each instruction.
+/// Therefore a test can name a branch target and does not have to count bytes.
 const Builder = struct {
     buffer: [128]u8 = undefined,
     len: usize = 0,
@@ -222,13 +232,13 @@ test "a program with branches, a call and a loop verifies" {
 
 test "an entry point past the first instruction is honoured" {
     var program: Builder = .{};
-    // Static data would normally live in its own region, but an entry point that
-    // skips a prologue has to work too.
+    // The static data is usually in its own region. But an entry point that goes
+    // past a prologue must also work.
     _ = program.addByte(0xfe);
     const entry = program.add(.halt, .none);
 
     try expectVerified(.{ .code = program.code(), .entry_point = @intCast(entry) });
-    // From offset 0 the same bytes do not decode.
+    // The same bytes do not decode from offset 0.
     try expectFailure(.{ .code = program.code() }, error.UnknownOpcode, 0);
 }
 
@@ -245,8 +255,8 @@ test "an entry point outside the code region is rejected" {
 
 test "a target inside another instruction is rejected" {
     var program: Builder = .{};
-    // Jump one byte into the `push`, where an operand byte would be executed as
-    // an opcode.
+    // This jump goes one byte into the `push`. At that byte, the VM executes an
+    // operand byte as an opcode.
     _ = program.add(.push, .{ .signed = 0 });
     const jump = program.add(.jmp, .{ .code_target = 1 });
 
@@ -254,12 +264,13 @@ test "a target inside another instruction is rejected" {
 }
 
 test "an overlap is caught when the instruction is decoded after its target" {
-    // The `jmp_not_zero` at 10 is decoded first and establishes a boundary
-    // there; the `push` it branches to then claims byte 10 as an operand. One of
-    // the two has to be wrong, whichever order the walk finds them in.
+    // The verifier decodes the `jmp_not_zero` at 10 first and makes a boundary
+    // at that offset. The `push` at its target then uses byte 10 as an operand.
+    // One of the two must be wrong. This is true for each possible sequence of
+    // the decodes.
     var program: Builder = .{};
     _ = program.add(.jmp, .{ .code_target = 10 });
-    _ = program.addByte(0); // unreachable filler
+    _ = program.addByte(0); // a byte that the program cannot reach
     const overlapping = program.addByte(@intFromEnum(OpCode.push));
     inline for (0..3) |_| _ = program.addByte(0);
     _ = program.addByte(@intFromEnum(OpCode.jmp_not_zero));
@@ -282,7 +293,8 @@ test "control must not fall off the end of the code region" {
     const push_offset = program.add(.push, .{ .signed = 1 });
     try expectFailure(.{ .code = program.code() }, error.ExecutionRunsOffEnd, push_offset);
 
-    // Ending on `halt`, `ret` or `jmp` is fine: none of them fall through.
+    // A program can end with `halt`, `ret` or `jmp`. Control does not continue
+    // after these instructions.
     for ([_]OpCode{ .halt, .ret }) |terminator| {
         var terminated: Builder = .{};
         _ = terminated.add(.push, .{ .signed = 1 });
@@ -305,7 +317,7 @@ test "a reachable unknown opcode or truncated operand is rejected" {
 test "unreachable bytes are ignored because they are never executed" {
     var program: Builder = .{};
     _ = program.add(.halt, .none);
-    // Garbage after `halt` is not reachable from the entry point.
+    // The program cannot reach these bytes after `halt` from the entry point.
     _ = program.addByte(0xfe);
     _ = program.addByte(@intFromEnum(OpCode.push));
 
@@ -328,7 +340,7 @@ test "data addresses are checked when the segment size is known" {
 
     try expectFailure(.{ .code = program.code(), .data_slots = 256 }, error.DataAddressOutOfRange, 0);
     try expectVerified(.{ .code = program.code(), .data_slots = 257 });
-    // A caller that does not fix the segment size leaves the check to the VM.
+    // If the caller does not set the size of the segment, the VM does this check.
     try expectVerified(.{ .code = program.code() });
 }
 

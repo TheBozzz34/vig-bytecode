@@ -4,16 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Exposed to dependents, which is the whole point of this package: the VM
-    // and the assembler both import it instead of copying its tables.
+    // This module is available to each dependent package. That is the function
+    // of this package: the VM and the assembler import the module. They do not
+    // copy its tables.
     _ = b.addModule("vig_bytecode", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    // A test executable only collects `test` blocks from its own root file, so
-    // every source file holding tests needs its own entry here.
+    // A test executable collects the `test` blocks from its own root file only.
+    // Therefore each source file that has tests needs an entry here.
     const test_roots = [_][]const u8{
         "src/root.zig",
         "src/opcode.zig",

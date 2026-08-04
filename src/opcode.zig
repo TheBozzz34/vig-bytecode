@@ -1,15 +1,9 @@
-//! Opcode identity and metadata.
+//! The identity and the metadata of an opcode.
 //!
-//! This is the single source of truth for the VIG instruction set. The VM used
-//! to keep its own opcode enum and an int-to-enum switch, and the assembler kept
-//! a third copy as a mnemonic table; adding an instruction meant editing all
-//! three and hoping the byte values agreed. Everything is now derived from
-//! `table`, whose shape is checked against `OpCode` at compile time.
 
 const std = @import("std");
 
-/// Every VIG instruction. The enum values are the on-disk opcode bytes and must
-/// stay dense and in ascending order, which the `comptime` block below asserts.
+/// Each VIG instruction.
 pub const OpCode = enum(u8) {
     halt = 0,
     push = 1,
@@ -40,12 +34,13 @@ pub const OpCode = enum(u8) {
     load_at = 26,
     store_at = 27,
 
-    /// Decode an opcode byte. Unassigned bytes are rejected rather than skipped.
+    /// Decode an opcode byte. The function gives an error for a byte that has
+    /// no instruction. It does not ignore that byte.
     pub fn fromByte(byte: u8) error{UnknownOpcode}!OpCode {
         return std.enums.fromInt(OpCode, byte) orelse error.UnknownOpcode;
     }
 
-    /// Look up the instruction an assembler mnemonic names.
+    /// Find the instruction that has this assembler mnemonic.
     pub fn fromMnemonic(text: []const u8) ?OpCode {
         for (table) |entry| {
             if (std.mem.eql(u8, text, entry.mnemonic)) return entry.code;
@@ -65,14 +60,16 @@ pub const OpCode = enum(u8) {
         return self.info().operand;
     }
 
-    /// Encoded length in bytes, including the opcode byte itself.
+    /// The length of the instruction in bytes. This length includes the opcode
+    /// byte.
     pub fn size(self: OpCode) usize {
         return 1 + self.operandKind().size();
     }
 
-    /// Whether execution can continue at the following instruction. `halt` stops
-    /// the VM and `ret` and `jmp` transfer control elsewhere, so the bytes after
-    /// them are only reachable through a jump or call.
+    /// This function is true if execution can continue at the next
+    /// instruction. `halt` stops the VM. `ret` and `jmp` move control to a
+    /// different offset. Therefore only a jump or a call can reach the bytes
+    /// after these three instructions.
     pub fn fallsThrough(self: OpCode) bool {
         return switch (self) {
             .halt, .ret, .jmp => false,
@@ -81,21 +78,24 @@ pub const OpCode = enum(u8) {
     }
 };
 
-/// What follows the opcode byte in the instruction stream.
+/// The data that comes after the opcode byte in the instruction stream.
 pub const OperandKind = enum {
-    /// Nothing; the instruction is a single byte.
+    /// No operand. The instruction is one byte.
     none,
-    /// Signed 32-bit immediate. Also how an address reaches the stack, since
-    /// code and static-data labels are pushed as ordinary values.
+    /// A signed 32-bit value in the instruction. This operand also puts an
+    /// address on the stack, because the assembler writes a code label or a
+    /// static-data label as a usual value.
     signed,
-    /// Unsigned 32-bit index into the VM data segment.
+    /// An unsigned 32-bit index into the VM data segment.
     data_address,
-    /// Unsigned 32-bit absolute offset into the container's code region.
+    /// An unsigned 32-bit absolute offset into the code region of the
+    /// container.
     code_target,
-    /// One-byte index into the container's import table.
+    /// A one-byte index into the import table of the container.
     import_index,
 
-    /// Operand length in bytes, excluding the opcode byte.
+    /// The length of the operand in bytes. This length does not include the
+    /// opcode byte.
     pub fn size(self: OperandKind) usize {
         return switch (self) {
             .none => 0,
@@ -104,7 +104,8 @@ pub const OperandKind = enum {
         };
     }
 
-    /// Whether an assembler may write a label address in this operand.
+    /// This function is true if an assembler can write a label address in this
+    /// operand.
     pub fn acceptsLabel(self: OperandKind) bool {
         return switch (self) {
             .signed, .code_target => true,
@@ -113,19 +114,21 @@ pub const OperandKind = enum {
     }
 };
 
-/// Human-readable description of one instruction, used by the assembler for
-/// mnemonic lookup and by documentation and diagnostics for the rest.
+/// A description of one instruction for a person to read. The assembler uses
+/// the mnemonic to find the instruction. The documentation and the diagnostic
+/// messages use the other fields.
 pub const Info = struct {
     code: OpCode,
     mnemonic: []const u8,
     operand: OperandKind,
-    /// Data-stack effect as `before → after`, where `a` is the lower value and
-    /// `b` the top one. Empty when the instruction leaves the data stack alone.
+    /// The effect on the data stack, as `before → after`. `a` is the lower
+    /// value and `b` is the top value. This field is empty if the instruction
+    /// does not change the data stack.
     stack_effect: []const u8,
     summary: []const u8,
 };
 
-/// Metadata for every instruction, indexed by opcode byte.
+/// The metadata for each instruction. The opcode byte is the index.
 pub const table = [_]Info{
     .{ .code = .halt, .mnemonic = "halt", .operand = .none, .stack_effect = "", .summary = "Stop execution." },
     .{ .code = .push, .mnemonic = "push", .operand = .signed, .stack_effect = "→ value", .summary = "Push a signed 32-bit integer." },
@@ -157,10 +160,11 @@ pub const table = [_]Info{
     .{ .code = .store_at, .mnemonic = "store_at", .operand = .none, .stack_effect = "value address →", .summary = "Pop a value into the data segment, using an address from the stack." },
 };
 
-// `table` is indexed by opcode byte, so it has to describe every instruction
-// exactly once and in order. Adding an `OpCode` without a table entry, or
-// listing entries out of order, is a compile error rather than a silent
-// mismatch between the assembler and the VM.
+// The opcode byte is the index into `table`. Therefore the table must describe
+// each instruction one time only, and in the correct sequence. A new `OpCode`
+// with no table entry gives a compile error. An entry in the wrong position
+// also gives a compile error. Without these checks, the assembler and the VM
+// can disagree with no message.
 comptime {
     const definition = @typeInfo(OpCode).@"enum";
     if (definition.field_names.len != table.len) {
@@ -187,7 +191,7 @@ test "unassigned opcode bytes and unknown mnemonics are rejected" {
     try std.testing.expectError(error.UnknownOpcode, OpCode.fromByte(@intCast(table.len)));
     try std.testing.expectError(error.UnknownOpcode, OpCode.fromByte(0xfe));
     try std.testing.expectEqual(@as(?OpCode, null), OpCode.fromMnemonic("nope"));
-    // Mnemonic matching is exact, not a prefix match.
+    // The mnemonic must be an exact match. A prefix is not sufficient.
     try std.testing.expectEqual(@as(?OpCode, null), OpCode.fromMnemonic("jmp_"));
 }
 
@@ -211,7 +215,8 @@ test "every instruction carries documentation" {
     for (table) |entry| {
         try std.testing.expect(entry.mnemonic.len > 0);
         try std.testing.expect(entry.summary.len > 0);
-        // Only instructions that leave the data stack alone may omit an effect.
+        // Only an instruction that does not change the data stack can have no
+        // effect text.
         if (entry.stack_effect.len == 0) {
             try std.testing.expect(switch (entry.code) {
                 .halt, .jmp, .call, .ret => true,
