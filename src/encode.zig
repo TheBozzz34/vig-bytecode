@@ -29,6 +29,8 @@ pub const Operand = union(enum) {
     data_address: u32,
     code_target: u32,
     import_index: u8,
+    local_index: u16,
+    frame_shape: FrameShape,
 
     pub fn kind(self: Operand) OperandKind {
         return switch (self) {
@@ -37,7 +39,21 @@ pub const Operand = union(enum) {
             .data_address => .data_address,
             .code_target => .code_target,
             .import_index => .import_index,
+            .local_index => .local_index,
+            .frame_shape => .frame_shape,
         };
+    }
+};
+
+/// The storage that a function asks for. The arguments come first in the frame, so
+/// the frame has `arguments + locals` slots and slot 0 is the first argument.
+pub const FrameShape = struct {
+    arguments: u16,
+    locals: u16,
+
+    /// The number of slots in the frame.
+    pub fn slots(self: FrameShape) u32 {
+        return @as(u32, self.arguments) + self.locals;
     }
 };
 
@@ -85,6 +101,11 @@ pub fn decode(code: []const u8, offset: usize) Error!Instruction {
             .data_address => .{ .data_address = std.mem.readInt(u32, bytes[0..4], .little) },
             .code_target => .{ .code_target = std.mem.readInt(u32, bytes[0..4], .little) },
             .import_index => .{ .import_index = bytes[0] },
+            .local_index => .{ .local_index = std.mem.readInt(u16, bytes[0..2], .little) },
+            .frame_shape => .{ .frame_shape = .{
+                .arguments = std.mem.readInt(u16, bytes[0..2], .little),
+                .locals = std.mem.readInt(u16, bytes[2..4], .little),
+            } },
         },
     };
 }
@@ -103,6 +124,11 @@ pub fn encode(dest: []u8, code: OpCode, operand: Operand) Error!usize {
         .signed => |value| std.mem.writeInt(i32, dest[1..5], value, .little),
         .data_address, .code_target => |value| std.mem.writeInt(u32, dest[1..5], value, .little),
         .import_index => |index| dest[1] = index,
+        .local_index => |index| std.mem.writeInt(u16, dest[1..3], index, .little),
+        .frame_shape => |shape| {
+            std.mem.writeInt(u16, dest[1..3], shape.arguments, .little);
+            std.mem.writeInt(u16, dest[3..5], shape.locals, .little);
+        },
     }
     return size;
 }
@@ -131,6 +157,31 @@ test "every operand kind round-trips" {
     try expectRoundTrip(.load, .{ .data_address = 255 });
     try expectRoundTrip(.jmp, .{ .code_target = std.math.maxInt(u32) });
     try expectRoundTrip(.foreign_call, .{ .import_index = 3 });
+    try expectRoundTrip(.load_local, .{ .local_index = 0 });
+    try expectRoundTrip(.store_local, .{ .local_index = std.math.maxInt(u16) });
+    try expectRoundTrip(.enter, .{ .frame_shape = .{ .arguments = 2, .locals = 3 } });
+    try expectRoundTrip(.enter, .{ .frame_shape = .{ .arguments = 0, .locals = 0 } });
+}
+
+test "a frame shape counts its arguments before its locals" {
+    var buffer: [5]u8 = undefined;
+    _ = try encode(&buffer, .enter, .{ .frame_shape = .{ .arguments = 1, .locals = 2 } });
+    // The arguments are the first pair of bytes, so the two counts cannot be swapped
+    // without this test failing.
+    try testing.expectEqualSlices(u8, &.{ @intFromEnum(OpCode.enter), 1, 0, 2, 0 }, &buffer);
+
+    const shape = (try decode(&buffer, 0)).operand.frame_shape;
+    try testing.expectEqual(@as(u16, 1), shape.arguments);
+    try testing.expectEqual(@as(u16, 2), shape.locals);
+    try testing.expectEqual(@as(u32, 3), shape.slots());
+}
+
+test "the frame instructions have the widths their operands need" {
+    try testing.expectEqual(@as(usize, 5), OpCode.enter.size());
+    try testing.expectEqual(@as(usize, 3), OpCode.load_local.size());
+    try testing.expectEqual(@as(usize, 3), OpCode.store_local.size());
+    try testing.expectEqual(@as(usize, 3), OpCode.local_addr.size());
+    try testing.expectEqual(@as(usize, 1), OpCode.ret_val.size());
 }
 
 test "operands are little-endian and follow the opcode byte" {

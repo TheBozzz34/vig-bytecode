@@ -56,6 +56,22 @@ pub const OpCode = enum(u8) {
     store16 = 46,
     store32 = 47,
 
+    // Call frames.
+    //
+    // `enter` gives a function its own storage. It takes the arguments off the
+    // operand stack and puts them in that storage, so an argument and a local are
+    // the same kind of thing afterwards: a numbered slot of the frame. Therefore one
+    // pair of instructions reaches both, and `local_addr` gives the address of
+    // either. A C parameter is an lvalue, and this is what makes it one.
+    //
+    // A frame needs a call to belong to. Therefore a function that has locals is
+    // called, and the entry point of a program is a stub that calls it.
+    enter = 48,
+    ret_val = 49,
+    load_local = 50,
+    store_local = 51,
+    local_addr = 52,
+
     /// Decode an opcode byte. The function gives an error for a byte that has
     /// no instruction. It does not ignore that byte.
     pub fn fromByte(byte: u8) error{UnknownOpcode}!OpCode {
@@ -94,7 +110,7 @@ pub const OpCode = enum(u8) {
     /// after these three instructions.
     pub fn fallsThrough(self: OpCode) bool {
         return switch (self) {
-            .halt, .ret, .jmp => false,
+            .halt, .ret, .ret_val, .jmp => false,
             else => true,
         };
     }
@@ -115,6 +131,12 @@ pub const OperandKind = enum {
     code_target,
     /// A one-byte index into the import table of the container.
     import_index,
+    /// A two-byte index of a slot in the frame of the running function. Slot 0 is
+    /// the first argument.
+    local_index,
+    /// Two two-byte counts: the arguments of a function and then its locals. Only
+    /// `enter` uses this operand.
+    frame_shape,
 
     /// The length of the operand in bytes. This length does not include the
     /// opcode byte.
@@ -122,7 +144,8 @@ pub const OperandKind = enum {
         return switch (self) {
             .none => 0,
             .import_index => 1,
-            .signed, .data_address, .code_target => 4,
+            .local_index => 2,
+            .signed, .data_address, .code_target, .frame_shape => 4,
         };
     }
 
@@ -136,7 +159,7 @@ pub const OperandKind = enum {
     pub fn acceptsLabel(self: OperandKind) bool {
         return switch (self) {
             .signed, .code_target, .data_address => true,
-            .none, .import_index => false,
+            .none, .import_index, .local_index, .frame_shape => false,
         };
     }
 };
@@ -205,6 +228,11 @@ pub const table = [_]Info{
     .{ .code = .store8, .mnemonic = "store8", .operand = .none, .stack_effect = "value address →", .summary = "Pop a value and write its low 8 bits to a memory address." },
     .{ .code = .store16, .mnemonic = "store16", .operand = .none, .stack_effect = "value address →", .summary = "Pop a value and write its low 16 bits to a memory address." },
     .{ .code = .store32, .mnemonic = "store32", .operand = .none, .stack_effect = "value address →", .summary = "Pop a value and write all 32 bits to a memory address." },
+    .{ .code = .enter, .mnemonic = "enter", .operand = .frame_shape, .stack_effect = "arg1 ... argN →", .summary = "Give the running function a frame, and move its arguments into it." },
+    .{ .code = .ret_val, .mnemonic = "ret_val", .operand = .none, .stack_effect = "value → value", .summary = "Return one value to the caller and discard the rest of the frame." },
+    .{ .code = .load_local, .mnemonic = "load_local", .operand = .local_index, .stack_effect = "→ frame[index]", .summary = "Push the value of an argument or a local of the running function." },
+    .{ .code = .store_local, .mnemonic = "store_local", .operand = .local_index, .stack_effect = "value →", .summary = "Pop a value into an argument or a local of the running function." },
+    .{ .code = .local_addr, .mnemonic = "local_addr", .operand = .local_index, .stack_effect = "→ address", .summary = "Push the memory address of an argument or a local of the running function." },
 };
 
 // The opcode byte is the index into `table`. Therefore the table must describe
