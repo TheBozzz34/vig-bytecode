@@ -1,11 +1,8 @@
 # vig-bytecode
 
-The definitions the [assembler](../vig-assembler) and the [VM](../vig-vm) both
-need: the instruction set, the foreign-call ABI limits, the container format, and
-the verifier. Each of those used to exist twice — an opcode enum plus an
-int-to-enum switch in the VM, and a mnemonic table in the assembler — so adding
-an instruction meant three edits that had to agree. Now there is one table, and a
-`comptime` check that it covers every opcode in order.
+Definitions for the VIG [assembler](../vig-assembler) and [VM](../vig-vm). Ibncludes
+the instruction set, foreign-call ABI limits, container format, and
+the verifier.
 
 ```powershell
 zig build test
@@ -46,28 +43,4 @@ The file length must equal the header plus those three lengths exactly.
 Each import-table entry is a library-name length, a symbol-name length, an
 argument count, one byte per argument type, then the two names, unterminated.
 
-Every flag bit is reserved in version 2 and a reader rejects any that are set,
-because a flag that changes how a program runs must not be silently ignored by an
-older VM. The same applies to the version field itself.
 
-### Why code and data are separate
-
-Recording the code length separately from the static data is what makes
-verification possible. In a single blob, a walk over the program would decode
-string bytes as instructions; with the split, the verifier can walk only the code
-and prove that:
-
-- every reachable instruction decodes and fits inside the code region;
-- every jump and call lands on an instruction boundary rather than inside one;
-- control never falls off the end of the code;
-- every `foreign_call` names a declared import, and `load`/`store` addresses stay
-  inside the data segment.
-
-The walk follows branches from the entry point rather than sweeping linearly, so
-unreachable bytes are ignored — they are never executed.
-
-### Older files
-
-Version 1 containers (a six-byte prefix, an import table, then code and strings
-in one blob) and bare headerless code still load and run. They carry no code/data
-split, so they cannot be verified and rely on the VM's runtime checks alone.
