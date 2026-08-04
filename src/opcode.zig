@@ -46,6 +46,23 @@ pub const OpCode = enum(u8) {
     print_hex = 38,
     write_byte = 39,
 
+    // Byte-addressed access to guest memory. Each of these takes its address from
+    // the stack, and that address is a byte offset into the memory of the VM: the
+    // code region, then the static data, then the space above the program image.
+    //
+    // A narrow load must say whether it extends the sign of the value it read,
+    // because the stack holds an i32. C needs both forms: `char` and `signed char`
+    // extend, `unsigned char` does not. One instruction could not serve the two.
+    // A store needs no such pair, because it writes the low bits either way.
+    load8_u = 40,
+    load8_s = 41,
+    load16_u = 42,
+    load16_s = 43,
+    load32 = 44,
+    store8 = 45,
+    store16 = 46,
+    store32 = 47,
+
     /// Decode an opcode byte. The function gives an error for a byte that has
     /// no instruction. It does not ignore that byte.
     pub fn fromByte(byte: u8) error{UnknownOpcode}!OpCode {
@@ -182,6 +199,14 @@ pub const table = [_]Info{
     .{ .code = .read_byte, .mnemonic = "read_byte", .operand = .none, .stack_effect = "→ byte", .summary = "Read one input byte, or push -1 at end of input." },
     .{ .code = .print_hex, .mnemonic = "print_hex", .operand = .none, .stack_effect = "a → a", .summary = "Print the top value as eight hexadecimal digits without removing it." },
     .{ .code = .write_byte, .mnemonic = "write_byte", .operand = .none, .stack_effect = "byte →", .summary = "Pop one value and write its low byte to the output stream." },
+    .{ .code = .load8_u, .mnemonic = "load8_u", .operand = .none, .stack_effect = "address → u8 at address", .summary = "Push the byte at a memory address, without its sign." },
+    .{ .code = .load8_s, .mnemonic = "load8_s", .operand = .none, .stack_effect = "address → i8 at address", .summary = "Push the byte at a memory address, with its sign extended." },
+    .{ .code = .load16_u, .mnemonic = "load16_u", .operand = .none, .stack_effect = "address → u16 at address", .summary = "Push the 16-bit value at a memory address, without its sign." },
+    .{ .code = .load16_s, .mnemonic = "load16_s", .operand = .none, .stack_effect = "address → i16 at address", .summary = "Push the 16-bit value at a memory address, with its sign extended." },
+    .{ .code = .load32, .mnemonic = "load32", .operand = .none, .stack_effect = "address → i32 at address", .summary = "Push the 32-bit value at a memory address." },
+    .{ .code = .store8, .mnemonic = "store8", .operand = .none, .stack_effect = "value address →", .summary = "Pop a value and write its low 8 bits to a memory address." },
+    .{ .code = .store16, .mnemonic = "store16", .operand = .none, .stack_effect = "value address →", .summary = "Pop a value and write its low 16 bits to a memory address." },
+    .{ .code = .store32, .mnemonic = "store32", .operand = .none, .stack_effect = "value address →", .summary = "Pop a value and write all 32 bits to a memory address." },
 };
 
 // The opcode byte is the index into `table`. Therefore the table must describe
