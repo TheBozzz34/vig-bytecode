@@ -1,7 +1,8 @@
 //! The VIG container format: the file that holds a program image.
 //!
-//! Format version 2 records the shape of the program in the header. Version 1
-//! left that shape implicit in the length of the file.
+//! Format version 3 adds a zero-filled length. Version 2 recorded the shape of the
+//! program in the header. Version 1 left that shape implicit in the length of the
+//! file.
 //!
 //! ```text
 //! offset size field
@@ -14,7 +15,8 @@
 //!     12    4 static-data length
 //!     16    4 entry point, a code offset
 //!     20    4 import-table length in bytes
-//!     24      import table, `import count` entries
+//!     24    4 zero-filled length
+//!     28      import table, `import count` entries
 //!            code
 //!            static data
 //! ```
@@ -27,11 +29,29 @@
 //! field let a reader refuse a container that it does not fully understand. The
 //! reader does not try to read such a container.
 //!
+//! The zero-filled length is the number of bytes that the VM must add after the
+//! static data. Those bytes are not in the file. A program declares an array of
+//! one thousand integers, and the file grows by nothing. Without this field the
+//! file would carry four thousand zeros.
+//!
+//! ## Why version 3 is not compatible with version 2
+//!
+//! In version 2 the operand of `load` and of `store` was an index into a separate
+//! segment of i32 slots. In version 3 that operand is a byte address in the one
+//! guest memory, the same address space that a label and a pointer use. Therefore
+//! `store 4` names the fifth slot of a segment in an old program and the fifth byte
+//! of memory in a new one.
+//!
+//! No reader can tell the two apart from the bytes, because the instruction did not
+//! change. Therefore a version 2 container must be refused and not run. The version
+//! field exists for exactly this. This package still reads the older forms, so a
+//! tool can report what a file holds. `Kind.isExecutable` says which forms a VM
+//! runs.
+//!
 //! A version 1 container has a six-byte prefix, then an import table, then one
-//! region with both the code and the data in it. This package can still read a
-//! version 1 container and bare code with no header. Therefore a program from
-//! before the current format continues to run. These two forms have no split of
-//! the code from the data, and no verifier can check them.
+//! region with both the code and the data in it. Bare code with no header is the
+//! oldest form of all. Neither form splits the code from the data, so no verifier
+//! can check them.
 
 const std = @import("std");
 const foreign = @import("foreign.zig");
@@ -39,12 +59,18 @@ const foreign = @import("foreign.zig");
 pub const magic = "VIGF";
 
 /// The format version that this package writes.
-pub const version: u8 = 2;
+pub const version: u8 = 3;
+/// The version before this one. Its `load` and `store` operands index a segment of
+/// i32 slots, so a VM must refuse it rather than read those operands as addresses.
+pub const slot_addressed_version: u8 = 2;
 /// The earlier format: the magic, the version and the import count. Then come
 /// the imports and one region that holds both the code and the data.
 pub const legacy_version: u8 = 1;
 
-pub const header_size = 24;
+pub const header_size = 28;
+/// The size of a version 2 header. This package reads such a header so a tool can
+/// report what an old file holds.
+pub const slot_addressed_header_size = 24;
 pub const legacy_header_size = 6;
 
 const offset_version = 4;
@@ -55,6 +81,7 @@ const offset_code_len = 8;
 const offset_data_len = 12;
 const offset_entry_point = 16;
 const offset_import_table_len = 20;
+const offset_bss_len = 24;
 
 pub const Error = error{
     InvalidContainerHeader,
@@ -95,6 +122,9 @@ pub const Header = struct {
     data_len: u32 = 0,
     entry_point: u32 = 0,
     import_table_len: u32 = 0,
+    /// The number of zero bytes that the VM adds after the static data. These
+    /// bytes are not in the file.
+    bss_len: u32 = 0,
 };
 
 /// How a file gives the shape of its contents.
@@ -104,14 +134,37 @@ pub const Kind = enum {
     /// Format version 1: an import table, then the code and the data in one
     /// region.
     legacy,
-    /// Format version 2. The top of this file gives the layout.
+    /// Format version 2. It splits the code from the data, but its `load` and
+    /// `store` operands index a segment of i32 slots and not guest memory.
+    slot_addressed,
+    /// Format version 3. The top of this file gives the layout.
     current,
 
     /// This function is true if the container keeps the code apart from the
     /// static data. A verifier needs this split to find where the instructions
     /// stop.
     pub fn separatesData(self: Kind) bool {
-        return self == .current;
+        return self == .current or self == .slot_addressed;
+    }
+
+    /// This function is true if a VM can run the container.
+    ///
+    /// Version 1 and version 2 are refused. Each one is a numbered format, and in
+    /// each one the operand of `load` and of `store` is an index into a segment of
+    /// i32 slots. That operand is now a byte address. No reader can tell the two
+    /// apart from the bytes, because the instruction did not change. Therefore a VM
+    /// that ran such a file would compute a wrong answer and report nothing.
+    ///
+    /// Bare code is still executable. It carries no version and no promise, it is
+    /// the oldest and least formal input, and the VM has never verified it. It is
+    /// also the only input that reaches the run-time checks of the VM, because a
+    /// verified container has already been refused for the faults that those checks
+    /// find. A test of those checks therefore needs this form.
+    pub fn isExecutable(self: Kind) bool {
+        return switch (self) {
+            .current, .raw => true,
+            .slot_addressed, .legacy => false,
+        };
     }
 };
 
@@ -129,9 +182,16 @@ pub const Image = struct {
     /// field is always empty for a `raw` image and a `legacy` image.
     data: []const u8,
 
-    /// The number of bytes that the program uses in VM memory.
-    pub fn imageLen(self: Image) usize {
+    /// The number of bytes of the program that come from the file: the code and the
+    /// static data. The VM copies exactly this many bytes into memory.
+    pub fn fileImageLen(self: Image) usize {
         return self.code.len + self.data.len;
+    }
+
+    /// The number of bytes that the program uses in VM memory. This total includes
+    /// the zero-filled region, which the file does not hold.
+    pub fn imageLen(self: Image) usize {
+        return self.fileImageLen() + self.header.bss_len;
     }
 
     pub fn importIterator(self: Image) ImportIterator {
@@ -160,27 +220,49 @@ pub fn writeHeader(header: Header, dest: *[header_size]u8) void {
     std.mem.writeInt(u32, dest[offset_data_len..][0..4], header.data_len, .little);
     std.mem.writeInt(u32, dest[offset_entry_point..][0..4], header.entry_point, .little);
     std.mem.writeInt(u32, dest[offset_import_table_len..][0..4], header.import_table_len, .little);
+    std.mem.writeInt(u32, dest[offset_bss_len..][0..4], header.bss_len, .little);
 }
 
-/// Read a header in format version 2. `parse` checks the fields against the
-/// remainder of the file.
+/// Read a header in format version 3, or in version 2.
+///
+/// A version 2 header has no zero-filled length and is four bytes shorter.
+/// `bss_len` is therefore zero for such a header. `parse` records the version in
+/// `Kind`, and a VM refuses to run anything that is not the current version.
 pub fn readHeader(bytes: []const u8) Error!Header {
-    if (!isContainer(bytes) or bytes.len < header_size) return error.InvalidContainerHeader;
-    if (bytes[offset_version] != version) return error.UnsupportedContainerVersion;
+    if (!isContainer(bytes) or bytes.len < slot_addressed_header_size) {
+        return error.InvalidContainerHeader;
+    }
+
+    const file_version = bytes[offset_version];
+    if (file_version != version and file_version != slot_addressed_version) {
+        return error.UnsupportedContainerVersion;
+    }
+    if (file_version == version and bytes.len < header_size) {
+        return error.InvalidContainerHeader;
+    }
     if (bytes[offset_reserved] != 0) return error.InvalidContainerHeader;
 
     const import_count = bytes[offset_import_count];
     if (import_count > foreign.max_imports) return error.TooManyForeignImports;
 
     return .{
-        .format_version = bytes[offset_version],
+        .format_version = file_version,
         .flags = try Flags.fromByte(bytes[offset_flags]),
         .import_count = import_count,
         .code_len = std.mem.readInt(u32, bytes[offset_code_len..][0..4], .little),
         .data_len = std.mem.readInt(u32, bytes[offset_data_len..][0..4], .little),
         .entry_point = std.mem.readInt(u32, bytes[offset_entry_point..][0..4], .little),
         .import_table_len = std.mem.readInt(u32, bytes[offset_import_table_len..][0..4], .little),
+        .bss_len = if (file_version == version)
+            std.mem.readInt(u32, bytes[offset_bss_len..][0..4], .little)
+        else
+            0,
     };
+}
+
+/// The size of the header that a file of this version has.
+fn headerSizeFor(file_version: u8) usize {
+    return if (file_version == version) header_size else slot_addressed_header_size;
 }
 
 /// Parse a container that this package can read, current or legacy.
@@ -198,15 +280,16 @@ pub fn parse(bytes: []const u8) Error!Image {
     if (bytes.len > magic.len and bytes[offset_version] == legacy_version) return parseLegacy(bytes);
 
     const header = try readHeader(bytes);
-    const declared = @as(u64, header_size) + header.import_table_len + header.code_len + header.data_len;
+    const prefix = headerSizeFor(header.format_version);
+    const declared = @as(u64, prefix) + header.import_table_len + header.code_len + header.data_len;
     if (declared != bytes.len) return error.ContainerSizeMismatch;
 
     // The declared lengths add up to the size of the file. Therefore these
     // offsets are safe.
-    const code_start = header_size + @as(usize, header.import_table_len);
+    const code_start = prefix + @as(usize, header.import_table_len);
     const code_end = code_start + @as(usize, header.code_len);
 
-    const imports = bytes[header_size..code_start];
+    const imports = bytes[prefix..code_start];
     // The table must decode to exactly `import_count` entries, and these
     // entries must fill `import_table_len` bytes. If they do not, the header and
     // the table disagree.
@@ -217,7 +300,7 @@ pub fn parse(bytes: []const u8) Error!Image {
     try checkEntryPoint(header.entry_point, header.code_len);
 
     return .{
-        .kind = .current,
+        .kind = if (header.format_version == version) .current else .slot_addressed,
         .header = header,
         .imports = imports,
         .code = bytes[code_start..code_end],
@@ -311,6 +394,9 @@ pub const Layout = struct {
     imports: []const foreign.Import = &.{},
     code: []const u8,
     data: []const u8 = &.{},
+    /// The number of zero bytes that come after the static data in memory. The file
+    /// does not hold these bytes.
+    bss_len: u32 = 0,
     entry_point: u32 = 0,
     flags: Flags = .{},
 };
@@ -336,6 +422,7 @@ pub fn write(layout: Layout, dest: []u8) Error!usize {
         .data_len = try castLen(layout.data.len),
         .entry_point = layout.entry_point,
         .import_table_len = @intCast(table_len),
+        .bss_len = layout.bss_len,
     }, dest[0..header_size]);
 
     var offset: usize = header_size;
@@ -475,9 +562,10 @@ test "unreadable containers are rejected rather than guessed at" {
 
     try testing.expectError(error.InvalidContainerHeader, parse(buffer[0 .. header_size - 1]));
 
-    // An unknown format version.
+    // An unknown format version. Version 2 is not unknown: this package reads it
+    // so a tool can report what an old file holds.
     buffer = good;
-    buffer[offset_version] = 3;
+    buffer[offset_version] = version + 1;
     try testing.expectError(error.UnsupportedContainerVersion, parse(&buffer));
 
     // A flag bit that this version does not define.
@@ -533,6 +621,52 @@ test "writing rejects layouts the format cannot express" {
     try testing.expectError(error.TooManyForeignImports, encodedSize(.{ .imports = &many, .code = &[_]u8{0} }));
 
     try testing.expectError(error.BufferTooSmall, write(.{ .code = &[_]u8{0} }, buffer[0..header_size]));
+}
+
+test "a zero-filled length is in the header and not in the file" {
+    // This is the reason for version 3. A program declares one thousand integers and
+    // the file grows by nothing.
+    const bytes = try writeAlloc(.{ .code = &[_]u8{0}, .data = "xy", .bss_len = 4000 });
+    defer testing.allocator.free(bytes);
+
+    try testing.expectEqual(@as(usize, header_size + 3), bytes.len);
+
+    const image = try parse(bytes);
+    try testing.expectEqual(@as(u32, 4000), image.header.bss_len);
+    // The file holds three bytes of the program. The program uses 4003 bytes of
+    // memory.
+    try testing.expectEqual(@as(usize, 3), image.fileImageLen());
+    try testing.expectEqual(@as(usize, 4003), image.imageLen());
+}
+
+test "a version 2 container reads, but it is not executable" {
+    // A version 2 header is four bytes shorter and has no zero-filled length. This
+    // package still reads one. But its `load` and `store` operands index a segment
+    // of slots, so a VM must refuse it rather than read them as addresses.
+    var buffer: [slot_addressed_header_size + 1]u8 = undefined;
+    var full: [header_size]u8 = undefined;
+    writeHeader(.{ .code_len = 1, .format_version = slot_addressed_version }, &full);
+    @memcpy(buffer[0..slot_addressed_header_size], full[0..slot_addressed_header_size]);
+    buffer[slot_addressed_header_size] = @intFromEnum(@import("opcode.zig").OpCode.halt);
+
+    const image = try parse(&buffer);
+    try testing.expectEqual(Kind.slot_addressed, image.kind);
+    try testing.expectEqual(slot_addressed_version, image.header.format_version);
+    // It splits the code from the data, so a verifier could read it.
+    try testing.expect(image.kind.separatesData());
+    // But no VM may run it.
+    try testing.expect(!image.kind.isExecutable());
+    try testing.expectEqual(@as(u32, 0), image.header.bss_len);
+}
+
+test "a numbered format that addressed slots is not executable" {
+    try testing.expect(Kind.current.isExecutable());
+    // Bare code carries no version and no promise, and it is the only input that
+    // reaches the run-time checks of the VM.
+    try testing.expect(Kind.raw.isExecutable());
+    // These two are numbered formats whose `load` and `store` operands meant a slot.
+    try testing.expect(!Kind.slot_addressed.isExecutable());
+    try testing.expect(!Kind.legacy.isExecutable());
 }
 
 test "the file-size bound covers the largest legal container" {

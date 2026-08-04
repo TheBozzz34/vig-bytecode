@@ -10,8 +10,8 @@
 //!   an operand byte as an opcode;
 //! - control does not continue past the end of the code region;
 //! - each `foreign_call` names an import that the container declares. Also,
-//!   `load` and `store` stay inside the data segment if the caller gives the
-//!   size of that segment.
+//!   `load` and `store` address guest memory inside its bounds if the caller gives
+//!   the size of that memory, and no `store` names an address in the code region.
 //!
 //! These checks are possible only because format version 2 records the code
 //! length apart from the static data. A read of a region that also holds strings
@@ -40,7 +40,13 @@ pub const Error = error{
     /// After an instruction, control continues past the end of the code region.
     ExecutionRunsOffEnd,
     UnknownForeignImport,
+    /// The operand of a `load` or a `store` names an address that is not in guest
+    /// memory, or an address whose four-byte access would run past the end of it.
     DataAddressOutOfRange,
+    /// The operand of a `store` names an address in the code region. Such a store
+    /// would change an instruction, and then the result of this verifier would say
+    /// nothing about the bytes that run.
+    StoreIntoCodeRegion,
     ScratchTooSmall,
 };
 
@@ -61,10 +67,21 @@ pub const Options = struct {
     /// The number of imports that the container declares. Each `foreign_call`
     /// index must be less than this number.
     import_count: u8 = 0,
-    /// The number of slots in the VM data segment. A `null` value stops the
-    /// address checks on `load` and `store`. Use `null` if the caller does not
-    /// set the size of the segment.
-    data_slots: ?u32 = null,
+    /// The number of bytes of guest memory. A `null` value stops the address checks
+    /// on `load` and `store`. Use `null` if the caller does not set the size of that
+    /// memory.
+    ///
+    /// The operand of `load` and of `store` is a byte address, and each of the two
+    /// reads or writes four bytes. Therefore the whole of that access must fit, and
+    /// an address four bytes from the end of memory is a fault.
+    memory_size: ?u32 = null,
+    /// The number of bytes of code. A `store` operand below this length would write
+    /// an instruction, which would make the result of this verifier untrue for the
+    /// rest of the run. A `null` value stops that check.
+    ///
+    /// This is normally the length of `code`. It is a separate field because the
+    /// assembler verifies a program before it decides the final image.
+    code_len: ?u32 = null,
 };
 
 /// The location of a failure, for a diagnostic message. `offset` is the
@@ -125,8 +142,22 @@ pub fn verify(options: Options, scratch: []Mark, failure: ?*Failure) Error!void 
             .import_index => |index| if (index >= options.import_count) {
                 return fail(failure, offset, error.UnknownForeignImport);
             },
-            .data_address => |address| if (options.data_slots) |slots| {
-                if (address >= slots) return fail(failure, offset, error.DataAddressOutOfRange);
+            .data_address => |address| {
+                // The access is four bytes wide, so the address alone is not enough.
+                // Written as a subtraction so it cannot overflow.
+                if (options.memory_size) |size| {
+                    if (size < 4 or address > size - 4) {
+                        return fail(failure, offset, error.DataAddressOutOfRange);
+                    }
+                }
+                // A `store` must not write the code. `load` may read it.
+                if (instruction.code == .store) {
+                    if (options.code_len) |code_len| {
+                        if (address < code_len) {
+                            return fail(failure, offset, error.StoreIntoCodeRegion);
+                        }
+                    }
+                }
             },
             else => {},
         }
@@ -215,11 +246,14 @@ fn expectFailure(options: Options, reason: Error, offset: usize) !void {
 
 test "a program with branches, a call and a loop verifies" {
     var program: Builder = .{};
-    const loop = program.add(.load, .{ .data_address = 0 });
+    // The address is past the end of the code, because a `store` must not write an
+    // instruction. This program is 32 bytes of code.
+    const global = 64;
+    const loop = program.add(.load, .{ .data_address = global });
     _ = program.add(.push, .{ .signed = 1 });
     _ = program.add(.sub, .none);
     _ = program.add(.dup, .none);
-    _ = program.add(.store, .{ .data_address = 0 });
+    _ = program.add(.store, .{ .data_address = global });
     _ = program.add(.jmp_not_zero, .{ .code_target = @intCast(loop) });
     const subroutine_call = program.len + OpCode.call.size() + OpCode.halt.size();
     _ = program.add(.call, .{ .code_target = @intCast(subroutine_call) });
@@ -227,7 +261,11 @@ test "a program with branches, a call and a loop verifies" {
     _ = program.add(.push, .{ .signed = 7 });
     _ = program.add(.ret, .none);
 
-    try expectVerified(.{ .code = program.code(), .data_slots = 256 });
+    try expectVerified(.{
+        .code = program.code(),
+        .memory_size = 256,
+        .code_len = @intCast(program.code().len),
+    });
 }
 
 test "an entry point past the first instruction is honoured" {
@@ -333,15 +371,52 @@ test "foreign calls must name a declared import" {
     try expectVerified(.{ .code = program.code(), .import_count = 2 });
 }
 
-test "data addresses are checked when the segment size is known" {
+test "a load or store address is checked when the size of memory is known" {
     var program: Builder = .{};
     _ = program.add(.store, .{ .data_address = 256 });
     _ = program.add(.halt, .none);
 
-    try expectFailure(.{ .code = program.code(), .data_slots = 256 }, error.DataAddressOutOfRange, 0);
-    try expectVerified(.{ .code = program.code(), .data_slots = 257 });
-    // If the caller does not set the size of the segment, the VM does this check.
+    // The access is four bytes wide. Therefore 256 needs memory of 260 bytes, and
+    // memory of 256 bytes or of 259 bytes is not enough.
+    try expectFailure(.{ .code = program.code(), .memory_size = 256 }, error.DataAddressOutOfRange, 0);
+    try expectFailure(.{ .code = program.code(), .memory_size = 259 }, error.DataAddressOutOfRange, 0);
+    try expectVerified(.{ .code = program.code(), .memory_size = 260 });
+
+    // If the caller does not set the size of memory, the VM does this check.
     try expectVerified(.{ .code = program.code() });
+}
+
+test "a store into the code region is refused before the program runs" {
+    var program: Builder = .{};
+    _ = program.add(.store, .{ .data_address = 0 });
+    _ = program.add(.halt, .none);
+    const code_len: u32 = @intCast(program.code().len);
+
+    // Address 0 is the first byte of the code. A program that wrote there would
+    // change an instruction that this verifier has already read.
+    try expectFailure(
+        .{ .code = program.code(), .code_len = code_len },
+        error.StoreIntoCodeRegion,
+        0,
+    );
+    // The last byte of the code is still the code.
+    try expectFailure(
+        .{ .code = program.code(), .code_len = code_len },
+        error.StoreIntoCodeRegion,
+        0,
+    );
+
+    // The first byte after the code is not.
+    var past: Builder = .{};
+    _ = past.add(.store, .{ .data_address = code_len });
+    _ = past.add(.halt, .none);
+    try expectVerified(.{ .code = past.code(), .code_len = code_len });
+
+    // A `load` may read the code, so the same address is accepted for it.
+    var reader: Builder = .{};
+    _ = reader.add(.load, .{ .data_address = 0 });
+    _ = reader.add(.halt, .none);
+    try expectVerified(.{ .code = reader.code(), .code_len = @intCast(reader.code().len) });
 }
 
 test "verification needs one scratch mark per code byte" {

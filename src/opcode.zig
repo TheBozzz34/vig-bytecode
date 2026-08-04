@@ -108,7 +108,7 @@ pub const OperandKind = enum {
     /// address on the stack, because the assembler writes a code label or a
     /// static-data label as a usual value.
     signed,
-    /// An unsigned 32-bit index into the VM data segment.
+    /// An unsigned 32-bit byte address in guest memory.
     data_address,
     /// An unsigned 32-bit absolute offset into the code region of the
     /// container.
@@ -128,10 +128,15 @@ pub const OperandKind = enum {
 
     /// This function is true if an assembler can write a label address in this
     /// operand.
+    ///
+    /// A data address accepts one, because a global is now a byte address in the
+    /// program image and a label is how a program names it. Before guest memory was
+    /// one address space, this operand was an index into a separate segment of slots
+    /// and no label could name it.
     pub fn acceptsLabel(self: OperandKind) bool {
         return switch (self) {
-            .signed, .code_target => true,
-            .none, .data_address, .import_index => false,
+            .signed, .code_target, .data_address => true,
+            .none, .import_index => false,
         };
     }
 };
@@ -172,14 +177,14 @@ pub const table = [_]Info{
     .{ .code = .jmp, .mnemonic = "jmp", .operand = .code_target, .stack_effect = "", .summary = "Jump unconditionally to an absolute code offset." },
     .{ .code = .jmp_zero, .mnemonic = "jmp_zero", .operand = .code_target, .stack_effect = "condition →", .summary = "Jump when condition is 0." },
     .{ .code = .jmp_not_zero, .mnemonic = "jmp_not_zero", .operand = .code_target, .stack_effect = "condition →", .summary = "Jump when condition is not 0." },
-    .{ .code = .load, .mnemonic = "load", .operand = .data_address, .stack_effect = "→ data[address]", .summary = "Push a value from the data segment." },
-    .{ .code = .store, .mnemonic = "store", .operand = .data_address, .stack_effect = "value →", .summary = "Pop a value into the data segment." },
+    .{ .code = .load, .mnemonic = "load", .operand = .data_address, .stack_effect = "→ i32 at address", .summary = "Push the 32-bit value at a byte address that the instruction holds." },
+    .{ .code = .store, .mnemonic = "store", .operand = .data_address, .stack_effect = "value →", .summary = "Pop a value and write 32 bits to a byte address that the instruction holds." },
     .{ .code = .call, .mnemonic = "call", .operand = .code_target, .stack_effect = "", .summary = "Save the next instruction offset and jump to target." },
     .{ .code = .ret, .mnemonic = "ret", .operand = .none, .stack_effect = "", .summary = "Return to the offset saved by call." },
     .{ .code = .foreign_call, .mnemonic = "foreign_call", .operand = .import_index, .stack_effect = "arg1 ... argN → result", .summary = "Call an imported foreign function." },
     .{ .code = .print_string, .mnemonic = "print_string", .operand = .none, .stack_effect = "address → address", .summary = "Print the NUL-terminated string at a program address." },
-    .{ .code = .load_at, .mnemonic = "load_at", .operand = .none, .stack_effect = "address → data[address]", .summary = "Push a data-segment value, using an address from the stack." },
-    .{ .code = .store_at, .mnemonic = "store_at", .operand = .none, .stack_effect = "value address →", .summary = "Pop a value into the data segment, using an address from the stack." },
+    .{ .code = .load_at, .mnemonic = "load_at", .operand = .none, .stack_effect = "address → i32 at address", .summary = "The same instruction as load32. The older name is kept." },
+    .{ .code = .store_at, .mnemonic = "store_at", .operand = .none, .stack_effect = "value address →", .summary = "The same instruction as store32. The older name is kept." },
     .{ .code = .@"and", .mnemonic = "and", .operand = .none, .stack_effect = "a b → a & b", .summary = "Compute the bitwise AND of two values." },
     .{ .code = .@"or", .mnemonic = "or", .operand = .none, .stack_effect = "a b → a | b", .summary = "Compute the bitwise OR of two values." },
     .{ .code = .xor, .mnemonic = "xor", .operand = .none, .stack_effect = "a b → a ^ b", .summary = "Compute the bitwise XOR of two values." },
