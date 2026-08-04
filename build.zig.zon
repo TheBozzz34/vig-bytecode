@@ -1,0 +1,12 @@
+.{
+    .name = .vig_bytecode,
+    .version = "0.1.0",
+    .fingerprint = 0x79e5b13894fbc013, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0-dev.1543+6db520a4c",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
