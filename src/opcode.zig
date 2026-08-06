@@ -109,6 +109,47 @@ pub const OpCode = enum(u8) {
     // instead of a comparison for every case.
     jmp_indirect = 63,
 
+    // Single-precision floating point.
+    //
+    // A value is one slot holding the bits of an IEEE-754 binary32. The stack
+    // says nothing about what a slot means, so the instruction decides, exactly
+    // as it does for a signed and an unsigned integer.
+    //
+    // None of these traps except the two conversions to an integer. IEEE gives
+    // every arithmetic operation an answer — a division by zero is an infinity
+    // and not a fault — so trapping here would be this VM inventing a rule the
+    // format does not have. That is the one place where the floating-point
+    // instructions do not follow the habit of the integer ones.
+    fadd = 64,
+    fsub = 65,
+    fmul = 66,
+    fdiv = 67,
+    fneg = 68,
+    // `sqrt` is the one function of a mathematics library that IEEE-754
+    // specifies exactly, so it gives the same bits on every host. `sin` and the
+    // rest do not, and belong in a library written in C: an opcode for one would
+    // cost the VM its reproducibility.
+    fsqrt = 69,
+
+    // The comparisons, each pushing 1 or 0 as its integer counterpart does. A
+    // NaN compares false against everything including itself, so `fne` is the
+    // only one of the six that is true for one.
+    feq = 70,
+    fne = 71,
+    flt = 72,
+    fle = 73,
+    fgt = 74,
+    fge = 75,
+
+    // The conversions. `f2i` and `f2u` truncate toward zero, as a cast in C
+    // does, and trap on a value the integer cannot hold — a NaN included, which
+    // names no integer at all. Widening an integer never fails, though a large
+    // one loses the low bits that 24 bits of significand cannot keep.
+    f2i = 76,
+    f2u = 77,
+    i2f = 78,
+    u2f = 79,
+
     /// Decode an opcode byte. The function gives an error for a byte that has
     /// no instruction. It does not ignore that byte.
     pub fn fromByte(byte: u8) error{UnknownOpcode}!OpCode {
@@ -189,6 +230,22 @@ pub const OpCode = enum(u8) {
 
             .dup => .{ .pops = 1, .pushes = 2 },
             .swap => .{ .pops = 2, .pushes = 2 },
+
+            // A floating-point value is one slot, so these count the same as
+            // their integer counterparts. A comparison takes two floats and
+            // leaves an integer; a conversion takes one slot and leaves one.
+            .fneg, .fsqrt, .f2i, .f2u, .i2f, .u2f => .{ .pops = 1, .pushes = 1 },
+            .fadd,
+            .fsub,
+            .fmul,
+            .fdiv,
+            .feq,
+            .fne,
+            .flt,
+            .fle,
+            .fgt,
+            .fge,
+            => .{ .pops = 2, .pushes = 1 },
 
             // Two values in, one result out.
             .add,
@@ -360,6 +417,22 @@ pub const table = [_]Info{
     .{ .code = .mul_wrap, .mnemonic = "mul_wrap", .operand = .none, .stack_effect = "a b → a *% b", .summary = "Multiply two values and wrap modulo 2^32." },
     .{ .code = .call_indirect, .mnemonic = "call_indirect", .operand = .none, .stack_effect = "target →", .summary = "Save the next instruction offset and jump to a code address from the stack." },
     .{ .code = .jmp_indirect, .mnemonic = "jmp_indirect", .operand = .none, .stack_effect = "target →", .summary = "Jump to a code address from the stack, saving no return offset." },
+    .{ .code = .fadd, .mnemonic = "fadd", .operand = .none, .stack_effect = "a b → a + b", .summary = "Add two binary32 values." },
+    .{ .code = .fsub, .mnemonic = "fsub", .operand = .none, .stack_effect = "a b → a - b", .summary = "Subtract the top binary32 value from the next." },
+    .{ .code = .fmul, .mnemonic = "fmul", .operand = .none, .stack_effect = "a b → a * b", .summary = "Multiply two binary32 values." },
+    .{ .code = .fdiv, .mnemonic = "fdiv", .operand = .none, .stack_effect = "a b → a / b", .summary = "Divide binary32 values. A zero divisor gives an infinity or a NaN, not a trap." },
+    .{ .code = .fneg, .mnemonic = "fneg", .operand = .none, .stack_effect = "a → -a", .summary = "Negate a binary32 value, which flips its sign bit and nothing else." },
+    .{ .code = .fsqrt, .mnemonic = "fsqrt", .operand = .none, .stack_effect = "a → sqrt(a)", .summary = "The square root, which IEEE-754 specifies exactly. A negative operand gives a NaN." },
+    .{ .code = .feq, .mnemonic = "feq", .operand = .none, .stack_effect = "a b → bool", .summary = "Push 1 when a == b as binary32 values, otherwise 0." },
+    .{ .code = .fne, .mnemonic = "fne", .operand = .none, .stack_effect = "a b → bool", .summary = "Push 1 when a != b as binary32 values, otherwise 0. A NaN is unequal to everything." },
+    .{ .code = .flt, .mnemonic = "flt", .operand = .none, .stack_effect = "a b → bool", .summary = "Push 1 when a < b as binary32 values, otherwise 0." },
+    .{ .code = .fle, .mnemonic = "fle", .operand = .none, .stack_effect = "a b → bool", .summary = "Push 1 when a <= b as binary32 values, otherwise 0." },
+    .{ .code = .fgt, .mnemonic = "fgt", .operand = .none, .stack_effect = "a b → bool", .summary = "Push 1 when a > b as binary32 values, otherwise 0." },
+    .{ .code = .fge, .mnemonic = "fge", .operand = .none, .stack_effect = "a b → bool", .summary = "Push 1 when a >= b as binary32 values, otherwise 0." },
+    .{ .code = .f2i, .mnemonic = "f2i", .operand = .none, .stack_effect = "a → int", .summary = "Truncate a binary32 value toward zero to a signed integer. Traps if it does not fit." },
+    .{ .code = .f2u, .mnemonic = "f2u", .operand = .none, .stack_effect = "a → int", .summary = "Truncate a binary32 value toward zero to an unsigned integer. Traps if it does not fit." },
+    .{ .code = .i2f, .mnemonic = "i2f", .operand = .none, .stack_effect = "a → float", .summary = "Convert a signed integer to binary32, rounding to nearest." },
+    .{ .code = .u2f, .mnemonic = "u2f", .operand = .none, .stack_effect = "a → float", .summary = "Convert an unsigned integer to binary32, rounding to nearest." },
 };
 
 // The opcode byte is the index into `table`. Therefore the table must describe
