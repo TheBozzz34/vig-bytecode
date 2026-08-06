@@ -117,7 +117,45 @@ pub fn verify(options: Options, scratch: []Mark, failure: ?*Failure) Error!void 
     }
 
     marks[options.entry_point] = .pending;
-    var hint: usize = options.entry_point;
+    return walk(options, marks, options.entry_point, failure);
+}
+
+/// Verify the code that `target` can reach, and keep the marks that an earlier call
+/// left in `scratch`.
+///
+/// `call_indirect` takes its target from the stack, so no read of the code region
+/// can find that target and the walk from the entry point does not reach a function
+/// that only a pointer names. Such a function is therefore verified when a call
+/// first goes to it. The code region cannot change while a program runs, so the
+/// answer is the one that a check before the run would have given.
+///
+/// The caller must give the same `scratch` and the same `options.code` that `verify`
+/// received. A target that is already `boundary` was verified before, and this
+/// function then does nothing.
+pub fn verifyFrom(options: Options, scratch: []Mark, target: u32, failure: ?*Failure) Error!void {
+    const code = options.code;
+    if (scratch.len < scratchSize(code.len)) return fail(failure, 0, error.ScratchTooSmall);
+
+    const marks = scratch[0..code.len];
+    if (target >= marks.len) return fail(failure, target, error.TargetOutOfRange);
+
+    switch (marks[target]) {
+        // The instruction at this address has been decoded, and so has everything it
+        // can reach.
+        .boundary => return,
+        // The address is inside a different instruction, so a call to it would
+        // execute an operand byte as an opcode.
+        .interior => return fail(failure, target, error.MisalignedTarget),
+        .unknown, .pending => marks[target] = .pending,
+    }
+    return walk(options, marks, target, failure);
+}
+
+/// Decode every instruction that the pending marks can reach, and mark what it
+/// finds. `hint` is where the search for pending work starts.
+fn walk(options: Options, marks: []Mark, start: usize, failure: ?*Failure) Error!void {
+    const code = options.code;
+    var hint: usize = start;
 
     while (findPending(marks, hint)) |offset| {
         hint = offset;

@@ -72,6 +72,37 @@ pub const OpCode = enum(u8) {
     store_local = 51,
     local_addr = 52,
 
+    // The unsigned instructions.
+    //
+    // A VIG value is 32 bits and nothing on the stack says what those bits mean.
+    // Therefore `unsigned int` and `int` share every instruction whose result does
+    // not depend on the answer — an add, a store, a test for equality — and differ
+    // only in the ones here, where the sign bit decides the result.
+    lt_u = 53,
+    lte_u = 54,
+    gt_u = 55,
+    gte_u = 56,
+    div_u = 57,
+    mod_u = 58,
+
+    // The arithmetic shift right. `shr_u` fills the vacated bits with zeros and this
+    // one fills them with the sign bit, which is what a signed `>>` does.
+    shr_s = 59,
+
+    // The wrapping arithmetic.
+    //
+    // `add`, `sub` and `mul` trap on signed overflow, which is what a language wants
+    // where overflow is a fault. Unsigned arithmetic in C is defined to wrap instead,
+    // so a compiler needs a form that gives the low 32 bits and no trap. `add_wrap`
+    // came first; these two complete the set.
+    sub_wrap = 60,
+    mul_wrap = 61,
+
+    // A call whose target comes from the stack rather than from the instruction.
+    // This is what a function pointer needs, and with it a dispatch table, a
+    // comparison function and a method table become possible.
+    call_indirect = 62,
+
     /// Decode an opcode byte. The function gives an error for a byte that has
     /// no instruction. It does not ignore that byte.
     pub fn fromByte(byte: u8) error{UnknownOpcode}!OpCode {
@@ -233,6 +264,16 @@ pub const table = [_]Info{
     .{ .code = .load_local, .mnemonic = "load_local", .operand = .local_index, .stack_effect = "→ frame[index]", .summary = "Push the value of an argument or a local of the running function." },
     .{ .code = .store_local, .mnemonic = "store_local", .operand = .local_index, .stack_effect = "value →", .summary = "Pop a value into an argument or a local of the running function." },
     .{ .code = .local_addr, .mnemonic = "local_addr", .operand = .local_index, .stack_effect = "→ address", .summary = "Push the memory address of an argument or a local of the running function." },
+    .{ .code = .lt_u, .mnemonic = "lt_u", .operand = .none, .stack_effect = "a b → bool", .summary = "Push 1 when a < b as unsigned values, otherwise 0." },
+    .{ .code = .lte_u, .mnemonic = "lte_u", .operand = .none, .stack_effect = "a b → bool", .summary = "Push 1 when a <= b as unsigned values, otherwise 0." },
+    .{ .code = .gt_u, .mnemonic = "gt_u", .operand = .none, .stack_effect = "a b → bool", .summary = "Push 1 when a > b as unsigned values, otherwise 0." },
+    .{ .code = .gte_u, .mnemonic = "gte_u", .operand = .none, .stack_effect = "a b → bool", .summary = "Push 1 when a >= b as unsigned values, otherwise 0." },
+    .{ .code = .div_u, .mnemonic = "div_u", .operand = .none, .stack_effect = "a b → a / b", .summary = "Unsigned integer division. Traps on division by zero." },
+    .{ .code = .mod_u, .mnemonic = "mod_u", .operand = .none, .stack_effect = "a b → a % b", .summary = "Unsigned remainder. Traps on division by zero." },
+    .{ .code = .shr_s, .mnemonic = "shr_s", .operand = .none, .stack_effect = "a b → a >> (b mod 32)", .summary = "Shift right arithmetically by the low five bits of the shift count." },
+    .{ .code = .sub_wrap, .mnemonic = "sub_wrap", .operand = .none, .stack_effect = "a b → a -% b", .summary = "Subtract the top value from the next value and wrap modulo 2^32." },
+    .{ .code = .mul_wrap, .mnemonic = "mul_wrap", .operand = .none, .stack_effect = "a b → a *% b", .summary = "Multiply two values and wrap modulo 2^32." },
+    .{ .code = .call_indirect, .mnemonic = "call_indirect", .operand = .none, .stack_effect = "target →", .summary = "Save the next instruction offset and jump to a code address from the stack." },
 };
 
 // The opcode byte is the index into `table`. Therefore the table must describe
