@@ -465,3 +465,82 @@ test "verification needs one scratch mark per code byte" {
     try testing.expectEqual(@as(usize, 1), scratchSize(program.code().len));
     try testing.expectError(error.ScratchTooSmall, verify(.{ .code = program.code() }, &scratch, null));
 }
+
+test "verifying from an address reaches code that the first walk did not" {
+    // A function that only a `call_indirect` names is not reachable from the entry
+    // point, so the walk at load time leaves it unknown. `verifyFrom` is how the VM
+    // checks it when a call first goes there.
+    var program: Builder = .{};
+    _ = program.add(.halt, .none);
+    const function = program.add(.push, .{ .signed = 7 });
+    _ = program.add(.ret, .none);
+
+    const options: Options = .{ .code = program.code() };
+    var scratch: [128]Mark = undefined;
+    try verify(options, &scratch, null);
+
+    // The first walk stopped at `halt`, so the function is bytes it never read.
+    try testing.expectEqual(Mark.unknown, scratch[function]);
+
+    try verifyFrom(options, &scratch, @intCast(function), null);
+    try testing.expectEqual(Mark.boundary, scratch[function]);
+    // The `ret` after it was reached through the fall-through of the `push`.
+    try testing.expectEqual(Mark.boundary, scratch[function + OpCode.push.size()]);
+
+    // A second call is answered by the marks that the first one left.
+    try verifyFrom(options, &scratch, @intCast(function), null);
+}
+
+test "verifying from an address applies the checks that the first walk applies" {
+    var program: Builder = .{};
+    _ = program.add(.halt, .none);
+    // A function whose body runs off the end of the code region.
+    const runs_off = program.add(.push, .{ .signed = 1 });
+
+    const options: Options = .{ .code = program.code() };
+    var scratch: [128]Mark = undefined;
+    try verify(options, &scratch, null);
+
+    var failure: Failure = undefined;
+    try testing.expectError(
+        error.ExecutionRunsOffEnd,
+        verifyFrom(options, &scratch, @intCast(runs_off), &failure),
+    );
+    try testing.expectEqual(runs_off, failure.offset);
+
+    // An address with no instruction is refused before anything runs.
+    var unknown_byte: Builder = .{};
+    _ = unknown_byte.add(.halt, .none);
+    const bad = unknown_byte.addByte(0xfe);
+
+    const second: Options = .{ .code = unknown_byte.code() };
+    try verify(second, &scratch, null);
+    try testing.expectError(
+        error.UnknownOpcode,
+        verifyFrom(second, &scratch, @intCast(bad), &failure),
+    );
+}
+
+test "verifying from an address inside an instruction is refused" {
+    // The first walk marked the operand bytes of the `push`, so an address inside it
+    // is known to be no place to start. Without that mark the verifier would decode
+    // an operand byte as an opcode and could not tell.
+    var program: Builder = .{};
+    _ = program.add(.push, .{ .signed = 1 });
+    _ = program.add(.halt, .none);
+
+    const options: Options = .{ .code = program.code() };
+    var scratch: [128]Mark = undefined;
+    try verify(options, &scratch, null);
+    try testing.expectEqual(Mark.interior, scratch[1]);
+
+    var failure: Failure = undefined;
+    try testing.expectError(error.MisalignedTarget, verifyFrom(options, &scratch, 1, &failure));
+    try testing.expectEqual(@as(usize, 1), failure.offset);
+
+    // An address past the code region is not in the program at all.
+    try testing.expectError(
+        error.TargetOutOfRange,
+        verifyFrom(options, &scratch, @intCast(program.code().len), &failure),
+    );
+}
