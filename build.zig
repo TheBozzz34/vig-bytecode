@@ -22,6 +22,7 @@ pub fn build(b: *std.Build) void {
         "src/container.zig",
         "src/encode.zig",
         "src/verify.zig",
+        "src/disasm.zig",
     };
 
     const test_step = b.step("test", "Run tests");

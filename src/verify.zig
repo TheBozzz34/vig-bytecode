@@ -48,6 +48,27 @@ pub const Error = error{
     /// nothing about the bytes that run.
     StoreIntoCodeRegion,
     ScratchTooSmall,
+
+    // The errors of `checkStack` only. The checks above say that a program is safe
+    // to run; these say that it keeps the operand stack in the shape its own code
+    // expects, which is what a compiler gets wrong.
+
+    /// An instruction takes more values off the operand stack than the path that
+    /// reaches it has put there.
+    StackUnderflowAt,
+    /// Two paths reach the same instruction with the operand stack at two different
+    /// heights. One arm of a branch left something the other did not.
+    InconsistentStackDepth,
+    /// A `ret` leaves values on the operand stack, or a `ret_val` leaves none or
+    /// more than one.
+    UnbalancedReturn,
+    /// A function returns a value on one path and none on another, so no call site
+    /// can know what it leaves behind.
+    MixedReturnKinds,
+    /// A `call` names a function that does not begin with `enter`. Such a function
+    /// does not say how many arguments it takes, so the height after the call is not
+    /// something the verifier can work out.
+    UndeclaredCallTarget,
 };
 
 /// What the verifier knows about one byte of the code region.
@@ -82,6 +103,11 @@ pub const Options = struct {
     /// This is normally the length of `code`. It is a separate field because the
     /// assembler verifies a program before it decides the final image.
     code_len: ?u32 = null,
+    /// The number of arguments that each import takes, in the order of the import
+    /// table. `checkStack` needs it, because the number of values a `foreign_call`
+    /// consumes is in the import table and not in the instruction. An empty slice
+    /// stops `checkStack` at the first `foreign_call`.
+    import_args: []const u8 = &.{},
 };
 
 /// The location of a failure, for a diagnostic message. `offset` is the
@@ -209,6 +235,265 @@ fn walk(options: Options, marks: []Mark, start: usize, failure: ?*Failure) Error
             try schedule(marks, @intCast(next), offset, failure, &hint);
         }
     }
+}
+
+// The stack-depth check -------------------------------------------------------
+//
+// The checks above make a program safe to run. This one asks a different question:
+// does the program keep the operand stack in the shape its own code expects? A VM
+// that runs an unbalanced program gives a wrong answer or a trap far from the
+// instruction that caused it, and a compiler that emits one is hard to debug. The
+// check finds the instruction.
+//
+// The check is not part of `verify`. A program that fails it is not unsafe, and
+// every VIG program written before the check existed keeps its own stack in a way
+// the check would not follow. Therefore a caller asks for it, and the VM does not.
+//
+// What it cannot follow: a `call_indirect` names a function that no read of the code
+// can find, so the height after one is unknown and nothing after it on that path is
+// checked. The rest of the program still is.
+
+/// The height of the operand stack at one byte of the code region.
+pub const Depth = i32;
+
+/// No path has reached this offset.
+const unvisited: Depth = -1;
+/// The height here depends on a function that the code does not name.
+const unknown_depth: Depth = -2;
+
+/// The working space that `checkStack` needs. Each slice holds one entry for each
+/// byte of the code region.
+pub const StackScratch = struct {
+    /// The height at the first byte of each instruction.
+    depths: []Depth,
+    /// Which offsets the walk has reached and which it has finished.
+    walk: []Mark,
+    /// Working space for reading the shape of a called function.
+    signature: []Mark,
+};
+
+/// What a function takes from the operand stack and what it leaves there.
+const Signature = struct {
+    arguments: u16,
+    results: u8,
+};
+
+/// Check that the operand stack has one height at every instruction that a program
+/// can reach, that no instruction takes more than the path gave it, and that each
+/// function returns the number of values it says it does.
+///
+/// Run `verify` first. This check decodes the same instructions again, so a program
+/// that the structural checks refuse fails here for the same reason.
+pub fn checkStack(options: Options, scratch: StackScratch, failure: ?*Failure) Error!void {
+    const code = options.code;
+    if (scratch.depths.len < code.len or scratch.walk.len < code.len or
+        scratch.signature.len < code.len)
+    {
+        return fail(failure, 0, error.ScratchTooSmall);
+    }
+    if (code.len == 0) {
+        if (options.entry_point != 0) return fail(failure, options.entry_point, error.EntryPointOutOfRange);
+        return;
+    }
+    if (options.entry_point >= code.len) {
+        return fail(failure, options.entry_point, error.EntryPointOutOfRange);
+    }
+
+    const depths = scratch.depths[0..code.len];
+    const reached = scratch.walk[0..code.len];
+    @memset(depths, unvisited);
+    @memset(reached, .unknown);
+
+    // A program starts with an empty operand stack. A function that a `call` reaches
+    // is seeded with the arguments it declares, not with the height its caller had,
+    // so the body of a function is checked once however many places call it.
+    try reach(depths, reached, options.entry_point, 0, options.entry_point, failure);
+
+    var hint: usize = options.entry_point;
+    while (findPending(reached, hint)) |offset| {
+        hint = offset;
+        reached[offset] = .boundary;
+
+        const instruction = encode.decode(code, offset) catch |err| return fail(failure, offset, switch (err) {
+            error.UnknownOpcode => error.UnknownOpcode,
+            else => error.TruncatedInstruction,
+        });
+        const depth = depths[offset];
+
+        // A height that no path can work out. The instruction is still decoded, so
+        // the code after a `call_indirect` is read, but no height is claimed for it.
+        if (depth == unknown_depth) continue;
+
+        var pops: Depth = 0;
+        var pushes: Depth = 0;
+        switch (instruction.code) {
+            // A control transfer with no successor in this function.
+            .halt => continue,
+            .ret, .ret_val => {
+                const expected: Depth = if (instruction.code == .ret_val) 1 else 0;
+                if (depth != expected) return fail(failure, offset, error.UnbalancedReturn);
+                continue;
+            },
+            .jmp => {
+                try reach(depths, reached, instruction.codeTarget().?, depth, offset, failure);
+                hint = @min(hint, instruction.codeTarget().?);
+                continue;
+            },
+            // The arguments go from the operand stack into the frame, so the
+            // instruction says how many it takes.
+            .enter => pops = instruction.operand.frame_shape.arguments,
+            // The number of arguments is in the import table.
+            .foreign_call => {
+                const index = instruction.operand.import_index;
+                if (index >= options.import_args.len) {
+                    return fail(failure, offset, error.UnknownForeignImport);
+                }
+                pops = options.import_args[index];
+                pushes = 1;
+            },
+            .call => {
+                const target = instruction.codeTarget().?;
+                const signature = try signatureOf(options, target, scratch.signature, failure);
+                // The callee is checked from its own `enter`, where its height is the
+                // arguments it declared.
+                try reach(depths, reached, target, signature.arguments, offset, failure);
+                hint = @min(hint, target);
+
+                pops = signature.arguments;
+                pushes = signature.results;
+            },
+            // The target is a value, so no read of the code says which function this
+            // is. The height after it is unknown, and it is the one instruction that
+            // stops the check.
+            .call_indirect => {
+                if (depth < 1) return fail(failure, offset, error.StackUnderflowAt);
+                if (instruction.code.fallsThrough()) {
+                    try reach(depths, reached, @intCast(instruction.end()), unknown_depth, offset, failure);
+                }
+                continue;
+            },
+            else => {
+                const effect = instruction.code.stackEffect().?;
+                pops = effect.pops;
+                pushes = effect.pushes;
+            },
+        }
+
+        if (depth < pops) return fail(failure, offset, error.StackUnderflowAt);
+        const after = depth - pops + pushes;
+
+        // A conditional branch takes its condition first, so both ways continue at
+        // the height after the pop.
+        if (instruction.code == .jmp_zero or instruction.code == .jmp_not_zero) {
+            const target = instruction.codeTarget().?;
+            try reach(depths, reached, target, after, offset, failure);
+            hint = @min(hint, target);
+        }
+        if (instruction.code.fallsThrough()) {
+            try reach(depths, reached, @intCast(instruction.end()), after, offset, failure);
+        }
+    }
+}
+
+/// Give `target` the height `depth`, and schedule it if this is the first path to
+/// reach it. A second path must bring the same height.
+fn reach(
+    depths: []Depth,
+    reached: []Mark,
+    target: u32,
+    depth: Depth,
+    offset: usize,
+    failure: ?*Failure,
+) Error!void {
+    if (target >= depths.len) return fail(failure, offset, error.TargetOutOfRange);
+
+    if (reached[target] == .unknown) {
+        depths[target] = depth;
+        reached[target] = .pending;
+        return;
+    }
+    // An offset that a `call_indirect` made unknown stays unknown: a height from
+    // another path cannot be compared with one that was never worked out.
+    if (depths[target] == unknown_depth or depth == unknown_depth) {
+        depths[target] = unknown_depth;
+        return;
+    }
+    if (depths[target] != depth) return fail(failure, offset, error.InconsistentStackDepth);
+}
+
+/// What the function at `target` takes and leaves.
+///
+/// The arguments come from its `enter`, and the results from the return instruction
+/// it uses. Both are properties of the instructions and not of the heights, so this
+/// needs no depth and gives the same answer whatever the caller had. A function that
+/// only halts is read as leaving nothing, because control never comes back from it.
+///
+/// The walk here follows a jump and a fall-through and not a `call`, so the returns
+/// it finds belong to this function and not to one that this function calls.
+fn signatureOf(
+    options: Options,
+    target: u32,
+    scratch: []Mark,
+    failure: ?*Failure,
+) Error!Signature {
+    const code = options.code;
+    const first = encode.decode(code, target) catch |err| return fail(failure, target, switch (err) {
+        error.UnknownOpcode => error.UnknownOpcode,
+        else => error.TruncatedInstruction,
+    });
+    // Without `enter` the function does not say how many arguments it takes.
+    if (first.code != .enter) return fail(failure, target, error.UndeclaredCallTarget);
+
+    const marks = scratch[0..code.len];
+    @memset(marks, .unknown);
+    marks[target] = .pending;
+
+    var results: ?u8 = null;
+    var hint: usize = target;
+    while (findPending(marks, hint)) |offset| {
+        hint = offset;
+        marks[offset] = .boundary;
+
+        const instruction = encode.decode(code, offset) catch |err| return fail(failure, offset, switch (err) {
+            error.UnknownOpcode => error.UnknownOpcode,
+            else => error.TruncatedInstruction,
+        });
+
+        const returns: ?u8 = switch (instruction.code) {
+            .ret => 0,
+            .ret_val => 1,
+            else => null,
+        };
+        if (returns) |kind| {
+            if (results) |known| {
+                if (known != kind) return fail(failure, offset, error.MixedReturnKinds);
+            } else {
+                results = kind;
+            }
+        }
+
+        // A `call` goes to a different function, and a `call_indirect` to one that
+        // this walk cannot name. Neither leads to a return of this function.
+        if (instruction.code != .call and instruction.code != .call_indirect) {
+            if (instruction.codeTarget()) |next| {
+                if (next >= marks.len) return fail(failure, offset, error.TargetOutOfRange);
+                if (marks[next] == .unknown) {
+                    marks[next] = .pending;
+                    hint = @min(hint, next);
+                }
+            }
+        }
+        if (instruction.code.fallsThrough()) {
+            const next = instruction.end();
+            if (next >= code.len) return fail(failure, offset, error.ExecutionRunsOffEnd);
+            if (marks[next] == .unknown) {
+                marks[next] = .pending;
+                hint = @min(hint, next);
+            }
+        }
+    }
+
+    return .{ .arguments = first.operand.frame_shape.arguments, .results = results orelse 0 };
 }
 
 fn schedule(marks: []Mark, target: u32, offset: usize, failure: ?*Failure, hint: *usize) Error!void {

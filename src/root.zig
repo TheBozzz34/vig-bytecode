@@ -13,8 +13,10 @@
 //! - `container` defines the program header and import table.
 //! - `encode` encodes and decodes instructions.
 //! - `verify` checks instruction boundaries and control flow.
+//! - `disasm` writes the bytes of a program as text a person can read.
 
 pub const container = @import("container.zig");
+pub const disasm = @import("disasm.zig");
 pub const encode = @import("encode.zig");
 pub const foreign = @import("foreign.zig");
 pub const opcode = @import("opcode.zig");

@@ -145,6 +145,85 @@ pub const OpCode = enum(u8) {
             else => true,
         };
     }
+
+    /// How the instruction changes the height of the operand stack, or null if the
+    /// opcode alone does not say.
+    ///
+    /// The value is null for two kinds of instruction. One is a control transfer
+    /// that has no next instruction to hand a height to: `halt`, `jmp`, `ret` and
+    /// `ret_val`. The other is an instruction whose effect is written somewhere the
+    /// opcode is not — the operand of `enter`, the import table for `foreign_call`,
+    /// and the called function for `call` and `call_indirect`. A caller that tracks
+    /// the height must read those places itself.
+    pub fn stackEffect(self: OpCode) ?Effect {
+        return switch (self) {
+            // A control transfer, or an effect that the opcode does not hold.
+            .halt, .jmp, .ret, .ret_val => null,
+            .call, .call_indirect, .foreign_call, .enter => null,
+
+            // One value, from somewhere that is not the stack.
+            .push, .load, .read_i32, .read_byte, .load_local, .local_addr => .{ .pops = 0, .pushes = 1 },
+
+            // One value in, one value out. `print` and `print_hex` leave what they
+            // printed, and a narrow load replaces an address with what it found.
+            .print,
+            .print_hex,
+            .print_string,
+            .not,
+            .load_at,
+            .load8_u,
+            .load8_s,
+            .load16_u,
+            .load16_s,
+            .load32,
+            => .{ .pops = 1, .pushes = 1 },
+
+            // One value consumed.
+            .pop, .store, .store_local, .write_byte, .jmp_zero, .jmp_not_zero => .{ .pops = 1, .pushes = 0 },
+
+            .dup => .{ .pops = 1, .pushes = 2 },
+            .swap => .{ .pops = 2, .pushes = 2 },
+
+            // Two values in, one result out.
+            .add,
+            .sub,
+            .mul,
+            .div,
+            .mod,
+            .add_wrap,
+            .sub_wrap,
+            .mul_wrap,
+            .div_u,
+            .mod_u,
+            .eq,
+            .ne,
+            .lt,
+            .lte,
+            .gt,
+            .gte,
+            .lt_u,
+            .lte_u,
+            .gt_u,
+            .gte_u,
+            .@"and",
+            .@"or",
+            .xor,
+            .shl,
+            .shr_u,
+            .shr_s,
+            .rotl,
+            => .{ .pops = 2, .pushes = 1 },
+
+            // A value and the address to put it at.
+            .store_at, .store8, .store16, .store32 => .{ .pops = 2, .pushes = 0 },
+        };
+    }
+};
+
+/// What an instruction takes off the operand stack and what it puts back.
+pub const Effect = struct {
+    pops: u8,
+    pushes: u8,
 };
 
 /// The data that comes after the opcode byte in the instruction stream.
@@ -339,5 +418,59 @@ test "every instruction carries documentation" {
                 else => false,
             });
         }
+    }
+}
+
+test "the stack effect agrees with the effect written for a reader" {
+    // The two descriptions of an instruction are written by hand in different forms,
+    // so this test compares them where the text is simple enough to count: a name on
+    // each side of the arrow, and nothing else. That covers most of the set, and a
+    // new instruction whose two descriptions disagree fails here.
+    for (table) |entry| {
+        const effect = entry.code.stackEffect() orelse continue;
+        const arrow = std.mem.indexOf(u8, entry.stack_effect, "→") orelse continue;
+
+        const before = countNames(entry.stack_effect[0..arrow]) orelse continue;
+        const after = countNames(entry.stack_effect[arrow + "→".len ..]) orelse continue;
+
+        try std.testing.expectEqual(before, effect.pops);
+        try std.testing.expectEqual(after, effect.pushes);
+    }
+}
+
+/// The names that a stack effect gives to one value. A side of an effect that holds
+/// only these can be counted; anything else is prose written for a reader, and the
+/// test above leaves it alone. `a b` is two values, and `a + b` and `i32 at address`
+/// each describe one value in words that no count can follow.
+const value_names = [_][]const u8{ "a", "b", "bool", "value", "address", "condition", "byte", "target" };
+
+/// The number of values that one side of a stack effect names, or null if the text
+/// says anything else.
+fn countNames(text: []const u8) ?u8 {
+    var count: u8 = 0;
+    var words = std.mem.tokenizeAny(u8, text, " ");
+    words: while (words.next()) |word| {
+        for (value_names) |name| {
+            if (std.mem.eql(u8, word, name)) {
+                count += 1;
+                continue :words;
+            }
+        }
+        return null;
+    }
+    return count;
+}
+
+test "the instructions with no fixed effect are the ones that need more than an opcode" {
+    // A control transfer has no next instruction of its own to give a height to, and
+    // the other four hold their effect somewhere else. Every other instruction must
+    // answer, so a new one cannot join the set without a decision about its effect.
+    for (table) |entry| {
+        const expected_null = switch (entry.code) {
+            .halt, .jmp, .ret, .ret_val => true,
+            .call, .call_indirect, .foreign_call, .enter => true,
+            else => false,
+        };
+        try std.testing.expectEqual(expected_null, entry.code.stackEffect() == null);
     }
 }
