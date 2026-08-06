@@ -103,6 +103,12 @@ pub const OpCode = enum(u8) {
     // comparison function and a method table become possible.
     call_indirect = 62,
 
+    // A jump whose target comes from the stack. `call_indirect` reaches another
+    // function; this one reaches a label of the function it is already in, which
+    // is what a jump table needs: a `switch` becomes one load and one jump
+    // instead of a comparison for every case.
+    jmp_indirect = 63,
+
     /// Decode an opcode byte. The function gives an error for a byte that has
     /// no instruction. It does not ignore that byte.
     pub fn fromByte(byte: u8) error{UnknownOpcode}!OpCode {
@@ -158,7 +164,7 @@ pub const OpCode = enum(u8) {
     pub fn stackEffect(self: OpCode) ?Effect {
         return switch (self) {
             // A control transfer, or an effect that the opcode does not hold.
-            .halt, .jmp, .ret, .ret_val => null,
+            .halt, .jmp, .jmp_indirect, .ret, .ret_val => null,
             .call, .call_indirect, .foreign_call, .enter => null,
 
             // One value, from somewhere that is not the stack.
@@ -353,6 +359,7 @@ pub const table = [_]Info{
     .{ .code = .sub_wrap, .mnemonic = "sub_wrap", .operand = .none, .stack_effect = "a b → a -% b", .summary = "Subtract the top value from the next value and wrap modulo 2^32." },
     .{ .code = .mul_wrap, .mnemonic = "mul_wrap", .operand = .none, .stack_effect = "a b → a *% b", .summary = "Multiply two values and wrap modulo 2^32." },
     .{ .code = .call_indirect, .mnemonic = "call_indirect", .operand = .none, .stack_effect = "target →", .summary = "Save the next instruction offset and jump to a code address from the stack." },
+    .{ .code = .jmp_indirect, .mnemonic = "jmp_indirect", .operand = .none, .stack_effect = "target →", .summary = "Jump to a code address from the stack, saving no return offset." },
 };
 
 // The opcode byte is the index into `table`. Therefore the table must describe
@@ -467,7 +474,7 @@ test "the instructions with no fixed effect are the ones that need more than an 
     // answer, so a new one cannot join the set without a decision about its effect.
     for (table) |entry| {
         const expected_null = switch (entry.code) {
-            .halt, .jmp, .ret, .ret_val => true,
+            .halt, .jmp, .jmp_indirect, .ret, .ret_val => true,
             .call, .call_indirect, .foreign_call, .enter => true,
             else => false,
         };

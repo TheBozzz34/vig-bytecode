@@ -372,6 +372,14 @@ pub fn checkStack(options: Options, scratch: StackScratch, failure: ?*Failure) E
                 }
                 continue;
             },
+            // An indirect jump takes its target from the stack as well, and has
+            // no successor at all: control leaves here and the code it goes to
+            // is code no read of this instruction can name. The height it needs
+            // is still counted, so a jump with an empty stack is still refused.
+            .jmp_indirect => {
+                if (depth < 1) return fail(failure, offset, error.StackUnderflowAt);
+                continue;
+            },
             else => {
                 const effect = instruction.code.stackEffect().?;
                 pops = effect.pops;
