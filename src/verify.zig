@@ -829,3 +829,207 @@ test "verifying from an address inside an instruction is refused" {
         verifyFrom(options, &scratch, @intCast(program.code().len), &failure),
     );
 }
+
+// The stack-depth check -------------------------------------------------------
+
+fn expectStackOk(options: Options) !void {
+    var depths: [128]Depth = undefined;
+    var walked: [128]Mark = undefined;
+    var signature: [128]Mark = undefined;
+    try checkStack(options, .{ .depths = &depths, .walk = &walked, .signature = &signature }, null);
+}
+
+fn expectStackFailure(options: Options, reason: Error, offset: usize) !void {
+    var depths: [128]Depth = undefined;
+    var walked: [128]Mark = undefined;
+    var signature: [128]Mark = undefined;
+    var failure: Failure = undefined;
+    try testing.expectError(reason, checkStack(
+        options,
+        .{ .depths = &depths, .walk = &walked, .signature = &signature },
+        &failure,
+    ));
+    try testing.expectEqual(reason, failure.reason);
+    try testing.expectEqual(offset, failure.offset);
+}
+
+test "a balanced program passes the stack check" {
+    var program: Builder = .{};
+    _ = program.add(.push, .{ .signed = 2 });
+    _ = program.add(.push, .{ .signed = 3 });
+    _ = program.add(.add, .none);
+    _ = program.add(.print, .none);
+    _ = program.add(.pop, .none);
+    _ = program.add(.halt, .none);
+
+    try expectStackOk(.{ .code = program.code() });
+}
+
+test "an instruction that takes more than the path gave it is refused" {
+    // One value on the stack and an `add` that needs two. The VM finds this when it
+    // runs; the check finds it before anything runs, and it names the instruction.
+    var program: Builder = .{};
+    _ = program.add(.push, .{ .signed = 1 });
+    const bad = program.add(.add, .none);
+    _ = program.add(.halt, .none);
+
+    try expectStackFailure(.{ .code = program.code() }, error.StackUnderflowAt, bad);
+}
+
+test "two paths must reach an instruction with the same height" {
+    // The arm that jumps leaves a value and the arm that falls through does not.
+    // Therefore the instruction they meet at has two heights, and the mistake shows
+    // up somewhere else entirely when the program runs.
+    const second_push = OpCode.push.size() + OpCode.jmp_zero.size();
+    const join = second_push + OpCode.push.size();
+
+    var program: Builder = .{};
+    _ = program.add(.push, .{ .signed = 1 });
+    _ = program.add(.jmp_zero, .{ .code_target = @intCast(join) });
+    _ = program.add(.push, .{ .signed = 7 });
+    _ = program.add(.halt, .none);
+
+    // The failure names the instruction that carried the second height to the join,
+    // and not the join itself: that is the instruction a person has to look at.
+    try expectStackFailure(.{ .code = program.code() }, error.InconsistentStackDepth, second_push);
+}
+
+test "both arms of a branch may leave the same height" {
+    const second_push = OpCode.push.size() + OpCode.jmp_zero.size() + OpCode.push.size() +
+        OpCode.jmp.size();
+
+    var program: Builder = .{};
+    _ = program.add(.push, .{ .signed = 1 });
+    // Jump past the first `push` to the second one. Both arms leave one value.
+    _ = program.add(.jmp_zero, .{ .code_target = @intCast(second_push) });
+    _ = program.add(.push, .{ .signed = 2 });
+    _ = program.add(.jmp, .{ .code_target = @intCast(second_push + OpCode.push.size()) });
+    _ = program.add(.push, .{ .signed = 3 });
+    _ = program.add(.print, .none);
+    _ = program.add(.pop, .none);
+    _ = program.add(.halt, .none);
+
+    try expectStackOk(.{ .code = program.code() });
+}
+
+test "a function is checked against the arguments and the result it declares" {
+    // `square(6)`: the call takes one argument and leaves one result, so the caller
+    // is balanced and so is the function.
+    const function = OpCode.push.size() + OpCode.call.size() + OpCode.print.size() +
+        OpCode.pop.size() + OpCode.halt.size();
+
+    var program: Builder = .{};
+    _ = program.add(.push, .{ .signed = 6 });
+    _ = program.add(.call, .{ .code_target = @intCast(function) });
+    _ = program.add(.print, .none);
+    _ = program.add(.pop, .none);
+    _ = program.add(.halt, .none);
+
+    _ = program.add(.enter, .{ .frame_shape = .{ .arguments = 1, .locals = 0 } });
+    _ = program.add(.load_local, .{ .local_index = 0 });
+    _ = program.add(.load_local, .{ .local_index = 0 });
+    _ = program.add(.mul, .none);
+    _ = program.add(.ret_val, .none);
+
+    try expectStackOk(.{ .code = program.code() });
+}
+
+test "a function that leaves the wrong number of values is refused" {
+    const function = OpCode.call.size() + OpCode.halt.size();
+
+    // `ret_val` returns one value and this function has two on the stack.
+    var program: Builder = .{};
+    _ = program.add(.call, .{ .code_target = @intCast(function) });
+    _ = program.add(.halt, .none);
+    _ = program.add(.enter, .{ .frame_shape = .{ .arguments = 0, .locals = 0 } });
+    _ = program.add(.push, .{ .signed = 1 });
+    _ = program.add(.push, .{ .signed = 2 });
+    const bad = program.add(.ret_val, .none);
+
+    try expectStackFailure(.{ .code = program.code() }, error.UnbalancedReturn, bad);
+
+    // A `ret` that leaves a value behind is the same mistake the other way.
+    var leaks: Builder = .{};
+    _ = leaks.add(.call, .{ .code_target = @intCast(function) });
+    _ = leaks.add(.halt, .none);
+    _ = leaks.add(.enter, .{ .frame_shape = .{ .arguments = 0, .locals = 0 } });
+    _ = leaks.add(.push, .{ .signed = 1 });
+    const leaked = leaks.add(.ret, .none);
+
+    try expectStackFailure(.{ .code = leaks.code() }, error.UnbalancedReturn, leaked);
+}
+
+test "a function that returns a value on one path only is refused" {
+    // No call site can know what such a function leaves behind.
+    const function = OpCode.call.size() + OpCode.halt.size();
+    const branch = function + OpCode.enter.size() + OpCode.load_local.size();
+    const after = branch + OpCode.jmp_zero.size() + OpCode.push.size() + OpCode.ret_val.size();
+
+    var program: Builder = .{};
+    _ = program.add(.call, .{ .code_target = @intCast(function) });
+    _ = program.add(.halt, .none);
+    _ = program.add(.enter, .{ .frame_shape = .{ .arguments = 1, .locals = 0 } });
+    _ = program.add(.load_local, .{ .local_index = 0 });
+    // Jump over the `ret_val` to the `ret`.
+    _ = program.add(.jmp_zero, .{ .code_target = @intCast(after) });
+    _ = program.add(.push, .{ .signed = 1 });
+    _ = program.add(.ret_val, .none);
+    const mixed = program.add(.ret, .none);
+
+    try expectStackFailure(.{ .code = program.code() }, error.MixedReturnKinds, mixed);
+}
+
+test "a call to a function that declares no frame is refused" {
+    // Without `enter` the function does not say how many values it takes, so the
+    // height after the call is not something the check can work out.
+    const function = OpCode.call.size() + OpCode.halt.size();
+
+    var program: Builder = .{};
+    _ = program.add(.call, .{ .code_target = @intCast(function) });
+    _ = program.add(.halt, .none);
+    _ = program.add(.push, .{ .signed = 1 });
+    _ = program.add(.ret, .none);
+
+    try expectStackFailure(.{ .code = program.code() }, error.UndeclaredCallTarget, function);
+}
+
+test "a foreign call takes the arguments that the import table declares" {
+    var program: Builder = .{};
+    _ = program.add(.push, .{ .signed = 1 });
+    _ = program.add(.push, .{ .signed = 2 });
+    _ = program.add(.foreign_call, .{ .import_index = 0 });
+    _ = program.add(.pop, .none);
+    _ = program.add(.halt, .none);
+
+    // Two arguments in and one result out leaves the program balanced.
+    try expectStackOk(.{ .code = program.code(), .import_count = 1, .import_args = &.{2} });
+
+    // An import that takes three would need one more value than the program pushed.
+    try expectStackFailure(
+        .{ .code = program.code(), .import_count = 1, .import_args = &.{3} },
+        error.StackUnderflowAt,
+        OpCode.push.size() * 2,
+    );
+}
+
+test "the height after an indirect call is unknown and stops the check there" {
+    // The target is a value, so no read of the code says which function it is. The
+    // instructions after it are still decoded, and a mistake in them is not reported,
+    // because no height can be claimed for them.
+    var program: Builder = .{};
+    _ = program.add(.push, .{ .signed = 0 });
+    _ = program.add(.call_indirect, .none);
+    // An `add` with nothing on the stack. The check cannot know, and says nothing.
+    _ = program.add(.add, .none);
+    _ = program.add(.halt, .none);
+
+    try expectStackOk(.{ .code = program.code() });
+
+    // The target itself is still counted: `call_indirect` with an empty stack has
+    // nothing to take.
+    var empty: Builder = .{};
+    const bad = empty.add(.call_indirect, .none);
+    _ = empty.add(.halt, .none);
+
+    try expectStackFailure(.{ .code = empty.code() }, error.StackUnderflowAt, bad);
+}
