@@ -275,7 +275,9 @@ pub const StackScratch = struct {
 /// What a function takes from the operand stack and what it leaves there.
 const Signature = struct {
     arguments: u16,
-    results: u8,
+    /// `null` means no reachable return instruction: control cannot continue
+    /// at the caller's next instruction.
+    results: ?u8,
 };
 
 /// Check that the operand stack has one height at every instruction that a program
@@ -360,7 +362,15 @@ pub fn checkStack(options: Options, scratch: StackScratch, failure: ?*Failure) E
                 hint = @min(hint, target);
 
                 pops = signature.arguments;
-                pushes = signature.results;
+                if (signature.results) |results| {
+                    pushes = results;
+                } else {
+                    // A callee with no reachable return never gets back here.
+                    // Its arguments still have to be available at the call site,
+                    // but the following instruction is unreachable.
+                    if (depth < pops) return fail(failure, offset, error.StackUnderflowAt);
+                    continue;
+                }
             },
             // The target is a value, so no read of the code says which function this
             // is. The height after it is unknown, and it is the one instruction that
@@ -433,8 +443,8 @@ fn reach(
 ///
 /// The arguments come from its `enter`, and the results from the return instruction
 /// it uses. Both are properties of the instructions and not of the heights, so this
-/// needs no depth and gives the same answer whatever the caller had. A function that
-/// only halts is read as leaving nothing, because control never comes back from it.
+/// needs no depth and gives the same answer whatever the caller had. A function with
+/// no reachable return has no result at all: control never comes back from it.
 ///
 /// The walk here follows a jump and a fall-through and not a `call`, so the returns
 /// it finds belong to this function and not to one that this function calls.
@@ -501,7 +511,7 @@ fn signatureOf(
         }
     }
 
-    return .{ .arguments = first.operand.frame_shape.arguments, .results = results orelse 0 };
+    return .{ .arguments = first.operand.frame_shape.arguments, .results = results };
 }
 
 fn schedule(marks: []Mark, target: u32, offset: usize, failure: ?*Failure, hint: *usize) Error!void {
@@ -938,6 +948,23 @@ test "a function is checked against the arguments and the result it declares" {
     _ = program.add(.load_local, .{ .local_index = 0 });
     _ = program.add(.mul, .none);
     _ = program.add(.ret_val, .none);
+
+    try expectStackOk(.{ .code = program.code() });
+}
+
+test "a call to a function that never returns has no stack successor" {
+    // This models a C `main` with an endless event loop. The `pop` is in the
+    // startup stub after `call main`, but execution can never reach it.
+    const function = OpCode.call.size() + OpCode.pop.size() + OpCode.halt.size();
+    const loop = function + OpCode.enter.size();
+
+    var program: Builder = .{};
+    _ = program.add(.call, .{ .code_target = @intCast(function) });
+    _ = program.add(.pop, .none);
+    _ = program.add(.halt, .none);
+
+    _ = program.add(.enter, .{ .frame_shape = .{ .arguments = 0, .locals = 0 } });
+    _ = program.add(.jmp, .{ .code_target = @intCast(loop) });
 
     try expectStackOk(.{ .code = program.code() });
 }
