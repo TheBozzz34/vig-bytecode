@@ -425,8 +425,22 @@ pub fn write(layout: Layout, dest: []u8) Error!usize {
         .bss_len = layout.bss_len,
     }, dest[0..header_size]);
 
-    var offset: usize = header_size;
-    for (layout.imports) |import| {
+    var offset: usize = header_size + writeImportTable(layout.imports, dest[header_size..]);
+
+    @memcpy(dest[offset..][0..layout.code.len], layout.code);
+    offset += layout.code.len;
+    @memcpy(dest[offset..][0..layout.data.len], layout.data);
+    return offset + layout.data.len;
+}
+
+/// Write the import table alone, without a header around it, and give the number
+/// of bytes written. `dest` must hold `importTableLen(imports)` bytes or more.
+///
+/// The relocatable object format holds the same table in the same encoding, so
+/// both formats write it from here and neither can drift from the other.
+pub fn writeImportTable(imports: []const foreign.Import, dest: []u8) usize {
+    var offset: usize = 0;
+    for (imports) |import| {
         dest[offset] = @intCast(import.library.len);
         dest[offset + 1] = @intCast(import.symbol.len);
         dest[offset + 2] = import.arg_count;
@@ -440,14 +454,13 @@ pub fn write(layout: Layout, dest: []u8) Error!usize {
         @memcpy(dest[offset..][0..import.symbol.len], import.symbol);
         offset += import.symbol.len;
     }
-
-    @memcpy(dest[offset..][0..layout.code.len], layout.code);
-    offset += layout.code.len;
-    @memcpy(dest[offset..][0..layout.data.len], layout.data);
-    return offset + layout.data.len;
+    return offset;
 }
 
-fn importTableLen(imports: []const foreign.Import) Error!u32 {
+/// The number of bytes that `writeImportTable` needs for these imports. It is
+/// also where every limit on an import is applied: the count, the two name
+/// lengths and the number of arguments.
+pub fn importTableLen(imports: []const foreign.Import) Error!u32 {
     if (imports.len > foreign.max_imports) return error.TooManyForeignImports;
 
     var total: usize = 0;

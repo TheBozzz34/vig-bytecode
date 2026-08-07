@@ -11,6 +11,7 @@
 //!   and stack effects.
 //! - `foreign` defines the foreign-call argument types and interface limits.
 //! - `container` defines the program header and import table.
+//! - `object` defines the relocatable file that a linker joins into a container.
 //! - `encode` encodes and decodes instructions.
 //! - `verify` checks instruction boundaries and control flow.
 //! - `disasm` writes the bytes of a program as text a person can read.
@@ -19,6 +20,7 @@ pub const container = @import("container.zig");
 pub const disasm = @import("disasm.zig");
 pub const encode = @import("encode.zig");
 pub const foreign = @import("foreign.zig");
+pub const object = @import("object.zig");
 pub const opcode = @import("opcode.zig");
 pub const verify = @import("verify.zig");
 

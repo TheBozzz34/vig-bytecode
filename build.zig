@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
         "src/opcode.zig",
         "src/foreign.zig",
         "src/container.zig",
+        "src/object.zig",
         "src/encode.zig",
         "src/verify.zig",
         "src/disasm.zig",
