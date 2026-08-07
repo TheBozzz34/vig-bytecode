@@ -26,8 +26,11 @@ pub const Error = error{
 pub const Operand = union(enum) {
     none,
     signed: i32,
+    signed64: i64,
     data_address: u32,
+    data_address64: u64,
     code_target: u32,
+    code_target64: u64,
     import_index: u8,
     local_index: u16,
     frame_shape: FrameShape,
@@ -36,8 +39,11 @@ pub const Operand = union(enum) {
         return switch (self) {
             .none => .none,
             .signed => .signed,
+            .signed64 => .signed64,
             .data_address => .data_address,
+            .data_address64 => .data_address64,
             .code_target => .code_target,
+            .code_target64 => .code_target64,
             .import_index => .import_index,
             .local_index => .local_index,
             .frame_shape => .frame_shape,
@@ -98,8 +104,11 @@ pub fn decode(code: []const u8, offset: usize) Error!Instruction {
         .operand = switch (instruction.operandKind()) {
             .none => .none,
             .signed => .{ .signed = std.mem.readInt(i32, bytes[0..4], .little) },
+            .signed64 => .{ .signed64 = std.mem.readInt(i64, bytes[0..8], .little) },
             .data_address => .{ .data_address = std.mem.readInt(u32, bytes[0..4], .little) },
+            .data_address64 => .{ .data_address64 = std.mem.readInt(u64, bytes[0..8], .little) },
             .code_target => .{ .code_target = std.mem.readInt(u32, bytes[0..4], .little) },
+            .code_target64 => .{ .code_target64 = std.mem.readInt(u64, bytes[0..8], .little) },
             .import_index => .{ .import_index = bytes[0] },
             .local_index => .{ .local_index = std.mem.readInt(u16, bytes[0..2], .little) },
             .frame_shape => .{ .frame_shape = .{
@@ -122,7 +131,9 @@ pub fn encode(dest: []u8, code: OpCode, operand: Operand) Error!usize {
     switch (operand) {
         .none => {},
         .signed => |value| std.mem.writeInt(i32, dest[1..5], value, .little),
+        .signed64 => |value| std.mem.writeInt(i64, dest[1..9], value, .little),
         .data_address, .code_target => |value| std.mem.writeInt(u32, dest[1..5], value, .little),
+        .data_address64, .code_target64 => |value| std.mem.writeInt(u64, dest[1..9], value, .little),
         .import_index => |index| dest[1] = index,
         .local_index => |index| std.mem.writeInt(u16, dest[1..3], index, .little),
         .frame_shape => |shape| {
@@ -138,7 +149,7 @@ pub fn encode(dest: []u8, code: OpCode, operand: Operand) Error!usize {
 const testing = std.testing;
 
 fn expectRoundTrip(code: OpCode, operand: Operand) !void {
-    var buffer: [8]u8 = undefined;
+    var buffer: [9]u8 = undefined;
     const size = try encode(&buffer, code, operand);
     try testing.expectEqual(code.size(), size);
 
@@ -154,8 +165,10 @@ test "every operand kind round-trips" {
     try expectRoundTrip(.halt, .none);
     try expectRoundTrip(.push, .{ .signed = -42 });
     try expectRoundTrip(.push, .{ .signed = std.math.minInt(i32) });
+    try expectRoundTrip(.push64, .{ .signed64 = std.math.minInt(i64) });
     try expectRoundTrip(.load, .{ .data_address = 255 });
     try expectRoundTrip(.jmp, .{ .code_target = std.math.maxInt(u32) });
+    try expectRoundTrip(.jmp64, .{ .code_target64 = std.math.maxInt(u64) });
     try expectRoundTrip(.foreign_call, .{ .import_index = 3 });
     try expectRoundTrip(.load_local, .{ .local_index = 0 });
     try expectRoundTrip(.store_local, .{ .local_index = std.math.maxInt(u16) });

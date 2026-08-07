@@ -150,6 +150,74 @@ pub const OpCode = enum(u8) {
     i2f = 78,
     u2f = 79,
 
+    // VIG64 integer and address instructions. The VIG32 instructions above keep
+    // their exact 32-bit rules, even in a VIG64 program.
+    push64 = 80,
+    load64 = 81,
+    store64 = 82,
+    load64_at = 83,
+    store64_at = 84,
+    add64 = 85,
+    sub64 = 86,
+    mul64 = 87,
+    div64 = 88,
+    mod64 = 89,
+    eq64 = 90,
+    ne64 = 91,
+    lt64 = 92,
+    lte64 = 93,
+    gt64 = 94,
+    gte64 = 95,
+    lt64_u = 96,
+    lte64_u = 97,
+    gt64_u = 98,
+    gte64_u = 99,
+    div64_u = 100,
+    mod64_u = 101,
+    and64 = 102,
+    or64 = 103,
+    xor64 = 104,
+    not64 = 105,
+    shl64 = 106,
+    shr64_u = 107,
+    shr64_s = 108,
+    rotl64 = 109,
+    add64_wrap = 110,
+    sub64_wrap = 111,
+    mul64_wrap = 112,
+
+    // VIG64 binary64 floating point. `double` and `long double` use this set.
+    dadd = 113,
+    dsub = 114,
+    dmul = 115,
+    ddiv = 116,
+    dneg = 117,
+    dsqrt = 118,
+    deq = 119,
+    dne = 120,
+    dlt = 121,
+    dle = 122,
+    dgt = 123,
+    dge = 124,
+    d2i = 125,
+    d2u = 126,
+    d2l = 127,
+    d2ul = 128,
+    i2d = 129,
+    u2d = 130,
+    l2d = 131,
+    ul2d = 132,
+    f2d = 133,
+    d2f = 134,
+
+    // A VIG64 container can name an instruction beyond the VIG32 u32 code
+    // offset limit. Indirect control transfer already reads its target from a
+    // VIG64 stack item and needs no second opcode.
+    jmp64 = 135,
+    jmp_zero64 = 136,
+    jmp_not_zero64 = 137,
+    call64 = 138,
+
     /// Decode an opcode byte. The function gives an error for a byte that has
     /// no instruction. It does not ignore that byte.
     pub fn fromByte(byte: u8) error{UnknownOpcode}!OpCode {
@@ -188,7 +256,7 @@ pub const OpCode = enum(u8) {
     /// after these three instructions.
     pub fn fallsThrough(self: OpCode) bool {
         return switch (self) {
-            .halt, .ret, .ret_val, .jmp => false,
+            .halt, .ret, .ret_val, .jmp, .jmp64 => false,
             else => true,
         };
     }
@@ -205,11 +273,11 @@ pub const OpCode = enum(u8) {
     pub fn stackEffect(self: OpCode) ?Effect {
         return switch (self) {
             // A control transfer, or an effect that the opcode does not hold.
-            .halt, .jmp, .jmp_indirect, .ret, .ret_val => null,
-            .call, .call_indirect, .foreign_call, .enter => null,
+            .halt, .jmp, .jmp64, .jmp_indirect, .ret, .ret_val => null,
+            .call, .call64, .call_indirect, .foreign_call, .enter => null,
 
             // One value, from somewhere that is not the stack.
-            .push, .load, .read_i32, .read_byte, .load_local, .local_addr => .{ .pops = 0, .pushes = 1 },
+            .push, .push64, .load, .load64, .read_i32, .read_byte, .load_local, .local_addr => .{ .pops = 0, .pushes = 1 },
 
             // One value in, one value out. `print` and `print_hex` leave what they
             // printed, and a narrow load replaces an address with what it found.
@@ -223,10 +291,11 @@ pub const OpCode = enum(u8) {
             .load16_u,
             .load16_s,
             .load32,
+            .load64_at,
             => .{ .pops = 1, .pushes = 1 },
 
             // One value consumed.
-            .pop, .store, .store_local, .write_byte, .jmp_zero, .jmp_not_zero => .{ .pops = 1, .pushes = 0 },
+            .pop, .store, .store64, .store_local, .write_byte, .jmp_zero, .jmp_not_zero, .jmp_zero64, .jmp_not_zero64 => .{ .pops = 1, .pushes = 0 },
 
             .dup => .{ .pops = 1, .pushes = 2 },
             .swap => .{ .pops = 2, .pushes = 2 },
@@ -234,7 +303,10 @@ pub const OpCode = enum(u8) {
             // A floating-point value is one slot, so these count the same as
             // their integer counterparts. A comparison takes two floats and
             // leaves an integer; a conversion takes one slot and leaves one.
-            .fneg, .fsqrt, .f2i, .f2u, .i2f, .u2f => .{ .pops = 1, .pushes = 1 },
+            .fneg, .fsqrt, .f2i, .f2u, .i2f, .u2f,
+            .dneg, .dsqrt, .d2i, .d2u, .d2l, .d2ul, .i2d, .u2d, .l2d, .ul2d, .f2d, .d2f,
+            .not64,
+            => .{ .pops = 1, .pushes = 1 },
             .fadd,
             .fsub,
             .fmul,
@@ -245,6 +317,13 @@ pub const OpCode = enum(u8) {
             .fle,
             .fgt,
             .fge,
+            .add64, .sub64, .mul64, .div64, .mod64,
+            .add64_wrap, .sub64_wrap, .mul64_wrap,
+            .div64_u, .mod64_u,
+            .eq64, .ne64, .lt64, .lte64, .gt64, .gte64,
+            .lt64_u, .lte64_u, .gt64_u, .gte64_u,
+            .and64, .or64, .xor64, .shl64, .shr64_u, .shr64_s, .rotl64,
+            .dadd, .dsub, .dmul, .ddiv, .deq, .dne, .dlt, .dle, .dgt, .dge,
             => .{ .pops = 2, .pushes = 1 },
 
             // Two values in, one result out.
@@ -278,7 +357,7 @@ pub const OpCode = enum(u8) {
             => .{ .pops = 2, .pushes = 1 },
 
             // A value and the address to put it at.
-            .store_at, .store8, .store16, .store32 => .{ .pops = 2, .pushes = 0 },
+            .store_at, .store64_at, .store8, .store16, .store32 => .{ .pops = 2, .pushes = 0 },
         };
     }
 };
@@ -310,6 +389,12 @@ pub const OperandKind = enum {
     /// Two two-byte counts: the arguments of a function and then its locals. Only
     /// `enter` uses this operand.
     frame_shape,
+    /// A signed 64-bit value in the instruction.
+    signed64,
+    /// An unsigned 64-bit byte address in VIG64 guest memory.
+    data_address64,
+    /// An unsigned 64-bit code offset in a VIG64 container.
+    code_target64,
 
     /// The length of the operand in bytes. This length does not include the
     /// opcode byte.
@@ -319,6 +404,7 @@ pub const OperandKind = enum {
             .import_index => 1,
             .local_index => 2,
             .signed, .data_address, .code_target, .frame_shape => 4,
+            .signed64, .data_address64, .code_target64 => 8,
         };
     }
 
@@ -331,7 +417,7 @@ pub const OperandKind = enum {
     /// and no label could name it.
     pub fn acceptsLabel(self: OperandKind) bool {
         return switch (self) {
-            .signed, .code_target, .data_address => true,
+            .signed, .code_target, .data_address, .signed64, .code_target64, .data_address64 => true,
             .none, .import_index, .local_index, .frame_shape => false,
         };
     }
@@ -433,6 +519,65 @@ pub const table = [_]Info{
     .{ .code = .f2u, .mnemonic = "f2u", .operand = .none, .stack_effect = "a → int", .summary = "Truncate a binary32 value toward zero to an unsigned integer. Traps if it does not fit." },
     .{ .code = .i2f, .mnemonic = "i2f", .operand = .none, .stack_effect = "a → float", .summary = "Convert a signed integer to binary32, rounding to nearest." },
     .{ .code = .u2f, .mnemonic = "u2f", .operand = .none, .stack_effect = "a → float", .summary = "Convert an unsigned integer to binary32, rounding to nearest." },
+    .{ .code = .push64, .mnemonic = "push64", .operand = .signed64, .stack_effect = "-> value", .summary = "Push a signed 64-bit integer." },
+    .{ .code = .load64, .mnemonic = "load64", .operand = .data_address64, .stack_effect = "-> value", .summary = "Push the 64-bit value at a VIG64 byte address." },
+    .{ .code = .store64, .mnemonic = "store64", .operand = .data_address64, .stack_effect = "value ->", .summary = "Pop a value and write 64 bits to a VIG64 byte address." },
+    .{ .code = .load64_at, .mnemonic = "load64_at", .operand = .none, .stack_effect = "address -> value", .summary = "Replace a VIG64 address with the 64-bit value it names." },
+    .{ .code = .store64_at, .mnemonic = "store64_at", .operand = .none, .stack_effect = "value address ->", .summary = "Write a 64-bit value through a VIG64 address." },
+    .{ .code = .add64, .mnemonic = "add64", .operand = .none, .stack_effect = "a b -> a + b", .summary = "Add two signed 64-bit values." },
+    .{ .code = .sub64, .mnemonic = "sub64", .operand = .none, .stack_effect = "a b -> a - b", .summary = "Subtract two signed 64-bit values." },
+    .{ .code = .mul64, .mnemonic = "mul64", .operand = .none, .stack_effect = "a b -> a * b", .summary = "Multiply two signed 64-bit values." },
+    .{ .code = .div64, .mnemonic = "div64", .operand = .none, .stack_effect = "a b -> a / b", .summary = "Divide signed 64-bit values." },
+    .{ .code = .mod64, .mnemonic = "mod64", .operand = .none, .stack_effect = "a b -> a % b", .summary = "Find the signed 64-bit remainder." },
+    .{ .code = .eq64, .mnemonic = "eq64", .operand = .none, .stack_effect = "a b -> bool", .summary = "Compare two 64-bit values for equality." },
+    .{ .code = .ne64, .mnemonic = "ne64", .operand = .none, .stack_effect = "a b -> bool", .summary = "Compare two 64-bit values for inequality." },
+    .{ .code = .lt64, .mnemonic = "lt64", .operand = .none, .stack_effect = "a b -> bool", .summary = "Compare signed 64-bit values." },
+    .{ .code = .lte64, .mnemonic = "lte64", .operand = .none, .stack_effect = "a b -> bool", .summary = "Compare signed 64-bit values." },
+    .{ .code = .gt64, .mnemonic = "gt64", .operand = .none, .stack_effect = "a b -> bool", .summary = "Compare signed 64-bit values." },
+    .{ .code = .gte64, .mnemonic = "gte64", .operand = .none, .stack_effect = "a b -> bool", .summary = "Compare signed 64-bit values." },
+    .{ .code = .lt64_u, .mnemonic = "lt64_u", .operand = .none, .stack_effect = "a b -> bool", .summary = "Compare unsigned 64-bit values." },
+    .{ .code = .lte64_u, .mnemonic = "lte64_u", .operand = .none, .stack_effect = "a b -> bool", .summary = "Compare unsigned 64-bit values." },
+    .{ .code = .gt64_u, .mnemonic = "gt64_u", .operand = .none, .stack_effect = "a b -> bool", .summary = "Compare unsigned 64-bit values." },
+    .{ .code = .gte64_u, .mnemonic = "gte64_u", .operand = .none, .stack_effect = "a b -> bool", .summary = "Compare unsigned 64-bit values." },
+    .{ .code = .div64_u, .mnemonic = "div64_u", .operand = .none, .stack_effect = "a b -> a / b", .summary = "Divide unsigned 64-bit values." },
+    .{ .code = .mod64_u, .mnemonic = "mod64_u", .operand = .none, .stack_effect = "a b -> a % b", .summary = "Find the unsigned 64-bit remainder." },
+    .{ .code = .and64, .mnemonic = "and64", .operand = .none, .stack_effect = "a b -> a & b", .summary = "Compute a 64-bit bitwise AND." },
+    .{ .code = .or64, .mnemonic = "or64", .operand = .none, .stack_effect = "a b -> a | b", .summary = "Compute a 64-bit bitwise OR." },
+    .{ .code = .xor64, .mnemonic = "xor64", .operand = .none, .stack_effect = "a b -> a ^ b", .summary = "Compute a 64-bit bitwise XOR." },
+    .{ .code = .not64, .mnemonic = "not64", .operand = .none, .stack_effect = "a -> a", .summary = "Invert every bit of a 64-bit value." },
+    .{ .code = .shl64, .mnemonic = "shl64", .operand = .none, .stack_effect = "a b -> a", .summary = "Shift a 64-bit value left by the low six count bits." },
+    .{ .code = .shr64_u, .mnemonic = "shr64_u", .operand = .none, .stack_effect = "a b -> a", .summary = "Shift a 64-bit value right without sign extension." },
+    .{ .code = .shr64_s, .mnemonic = "shr64_s", .operand = .none, .stack_effect = "a b -> a", .summary = "Shift a signed 64-bit value right." },
+    .{ .code = .rotl64, .mnemonic = "rotl64", .operand = .none, .stack_effect = "a b -> a", .summary = "Rotate a 64-bit value left by the low six count bits." },
+    .{ .code = .add64_wrap, .mnemonic = "add64_wrap", .operand = .none, .stack_effect = "a b -> a", .summary = "Add 64-bit values modulo 2 to the power of 64." },
+    .{ .code = .sub64_wrap, .mnemonic = "sub64_wrap", .operand = .none, .stack_effect = "a b -> a", .summary = "Subtract 64-bit values modulo 2 to the power of 64." },
+    .{ .code = .mul64_wrap, .mnemonic = "mul64_wrap", .operand = .none, .stack_effect = "a b -> a", .summary = "Multiply 64-bit values modulo 2 to the power of 64." },
+    .{ .code = .dadd, .mnemonic = "dadd", .operand = .none, .stack_effect = "a b -> a", .summary = "Add two binary64 values." },
+    .{ .code = .dsub, .mnemonic = "dsub", .operand = .none, .stack_effect = "a b -> a", .summary = "Subtract two binary64 values." },
+    .{ .code = .dmul, .mnemonic = "dmul", .operand = .none, .stack_effect = "a b -> a", .summary = "Multiply two binary64 values." },
+    .{ .code = .ddiv, .mnemonic = "ddiv", .operand = .none, .stack_effect = "a b -> a", .summary = "Divide binary64 values." },
+    .{ .code = .dneg, .mnemonic = "dneg", .operand = .none, .stack_effect = "a -> a", .summary = "Negate a binary64 value." },
+    .{ .code = .dsqrt, .mnemonic = "dsqrt", .operand = .none, .stack_effect = "a -> a", .summary = "Find the square root of a binary64 value." },
+    .{ .code = .deq, .mnemonic = "deq", .operand = .none, .stack_effect = "a b -> bool", .summary = "Compare binary64 values for equality." },
+    .{ .code = .dne, .mnemonic = "dne", .operand = .none, .stack_effect = "a b -> bool", .summary = "Compare binary64 values for inequality." },
+    .{ .code = .dlt, .mnemonic = "dlt", .operand = .none, .stack_effect = "a b -> bool", .summary = "Compare binary64 values." },
+    .{ .code = .dle, .mnemonic = "dle", .operand = .none, .stack_effect = "a b -> bool", .summary = "Compare binary64 values." },
+    .{ .code = .dgt, .mnemonic = "dgt", .operand = .none, .stack_effect = "a b -> bool", .summary = "Compare binary64 values." },
+    .{ .code = .dge, .mnemonic = "dge", .operand = .none, .stack_effect = "a b -> bool", .summary = "Compare binary64 values." },
+    .{ .code = .d2i, .mnemonic = "d2i", .operand = .none, .stack_effect = "a -> value", .summary = "Convert binary64 to signed 32-bit integer." },
+    .{ .code = .d2u, .mnemonic = "d2u", .operand = .none, .stack_effect = "a -> value", .summary = "Convert binary64 to unsigned 32-bit integer." },
+    .{ .code = .d2l, .mnemonic = "d2l", .operand = .none, .stack_effect = "a -> value", .summary = "Convert binary64 to signed 64-bit integer." },
+    .{ .code = .d2ul, .mnemonic = "d2ul", .operand = .none, .stack_effect = "a -> value", .summary = "Convert binary64 to unsigned 64-bit integer." },
+    .{ .code = .i2d, .mnemonic = "i2d", .operand = .none, .stack_effect = "a -> a", .summary = "Convert signed 32-bit integer to binary64." },
+    .{ .code = .u2d, .mnemonic = "u2d", .operand = .none, .stack_effect = "a -> a", .summary = "Convert unsigned 32-bit integer to binary64." },
+    .{ .code = .l2d, .mnemonic = "l2d", .operand = .none, .stack_effect = "a -> a", .summary = "Convert signed 64-bit integer to binary64." },
+    .{ .code = .ul2d, .mnemonic = "ul2d", .operand = .none, .stack_effect = "a -> a", .summary = "Convert unsigned 64-bit integer to binary64." },
+    .{ .code = .f2d, .mnemonic = "f2d", .operand = .none, .stack_effect = "a -> a", .summary = "Convert binary32 to binary64." },
+    .{ .code = .d2f, .mnemonic = "d2f", .operand = .none, .stack_effect = "a -> a", .summary = "Convert binary64 to binary32." },
+    .{ .code = .jmp64, .mnemonic = "jmp64", .operand = .code_target64, .stack_effect = "", .summary = "Jump to a 64-bit code offset." },
+    .{ .code = .jmp_zero64, .mnemonic = "jmp_zero64", .operand = .code_target64, .stack_effect = "condition ->", .summary = "Jump when a condition is zero." },
+    .{ .code = .jmp_not_zero64, .mnemonic = "jmp_not_zero64", .operand = .code_target64, .stack_effect = "condition ->", .summary = "Jump when a condition is not zero." },
+    .{ .code = .call64, .mnemonic = "call64", .operand = .code_target64, .stack_effect = "", .summary = "Call a target at a 64-bit code offset." },
 };
 
 // The opcode byte is the index into `table`. Therefore the table must describe
@@ -494,7 +639,7 @@ test "every instruction carries documentation" {
         // effect text.
         if (entry.stack_effect.len == 0) {
             try std.testing.expect(switch (entry.code) {
-                .halt, .jmp, .call, .ret => true,
+                .halt, .jmp, .jmp64, .call, .call64, .ret => true,
                 else => false,
             });
         }
@@ -547,8 +692,8 @@ test "the instructions with no fixed effect are the ones that need more than an 
     // answer, so a new one cannot join the set without a decision about its effect.
     for (table) |entry| {
         const expected_null = switch (entry.code) {
-            .halt, .jmp, .jmp_indirect, .ret, .ret_val => true,
-            .call, .call_indirect, .foreign_call, .enter => true,
+            .halt, .jmp, .jmp64, .jmp_indirect, .ret, .ret_val => true,
+            .call, .call64, .call_indirect, .foreign_call, .enter => true,
             else => false,
         };
         try std.testing.expectEqual(expected_null, entry.code.stackEffect() == null);

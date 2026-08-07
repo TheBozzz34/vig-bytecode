@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
     // A test executable collects the `test` blocks from its own root file only.
     // Therefore each source file that has tests needs an entry here.
     const test_roots = [_][]const u8{
+        "src/abi.zig",
         "src/root.zig",
         "src/opcode.zig",
         "src/foreign.zig",

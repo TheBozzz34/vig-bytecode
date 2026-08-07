@@ -68,6 +68,7 @@
 //! never needs one.
 
 const std = @import("std");
+const abi = @import("abi.zig");
 const container = @import("container.zig");
 const foreign = @import("foreign.zig");
 
@@ -76,11 +77,24 @@ pub const magic = "VIGO";
 /// The format version that this package writes. An object is a build artefact
 /// with a life of one command, so there is no older version to read: a file
 /// from another version is refused rather than translated.
-pub const version: u8 = 1;
+pub const vig32_version: u8 = abi.Profile.vig32.objectVersion();
+pub const vig64_version: u8 = abi.Profile.vig64.objectVersion();
+/// The version this package writes until the wider VIG64 object records are in
+/// place.
+pub const version: u8 = vig32_version;
+
+pub fn profileForVersion(file_version: u8) ?abi.Profile {
+    return abi.Profile.fromObjectVersion(file_version);
+}
 
 pub const header_size = 36;
 pub const symbol_record_size = 16;
 pub const relocation_record_size = 16;
+/// VIG64 objects use a wide header and fixed 32-byte symbol and relocation
+/// records. They are separate from the VIG32 records above.
+pub const vig64_header_size = 64;
+pub const vig64_symbol_record_size = 32;
+pub const vig64_relocation_record_size = 32;
 
 /// The largest alignment a symbol may ask for, as a power of two. A section of
 /// a VIG program is placed inside one small guest memory, so an alignment past
@@ -126,6 +140,12 @@ pub const Error = container.Error || error{
     InvalidRelocation,
     NameTooLong,
 };
+
+test "the numbered object versions select an explicit ABI profile" {
+    try std.testing.expectEqual(abi.Profile.vig32, profileForVersion(vig32_version).?);
+    try std.testing.expectEqual(abi.Profile.vig64, profileForVersion(vig64_version).?);
+    try std.testing.expect(profileForVersion(3) == null);
+}
 
 /// The flags for the complete object. Every bit is reserved, and a reader
 /// refuses an object that sets one. A tool must understand a flag before it can
@@ -264,6 +284,46 @@ pub const Relocation = struct {
     }
 };
 
+pub const Vig64RelocationType = enum(u8) {
+    code_target64 = 0,
+    data_address64 = 1,
+    guest_address64 = 2,
+    foreign_import8 = 3,
+
+    pub fn fromByte(byte: u8) Error!Vig64RelocationType {
+        return std.enums.fromInt(Vig64RelocationType, byte) orelse error.InvalidRelocation;
+    }
+
+    pub fn width(self: Vig64RelocationType) u64 {
+        return switch (self) {
+            .foreign_import8 => 1,
+            .code_target64, .data_address64, .guest_address64 => 8,
+        };
+    }
+};
+
+pub const Vig64Symbol = struct {
+    name: []const u8,
+    binding: Binding,
+    kind: SymbolKind,
+    section: Section,
+    offset: u64 = 0,
+    size: u64 = 0,
+    alignment: u32 = 1,
+};
+
+pub const Vig64Relocation = struct {
+    relocation_type: Vig64RelocationType,
+    section: Section,
+    offset: u64,
+    target: u64,
+    addend: i64 = 0,
+
+    pub fn width(self: Vig64Relocation) u64 {
+        return self.relocation_type.width();
+    }
+};
+
 /// One `extern` declaration of this object, with the index that its own
 /// `foreign_call` instructions use.
 pub const ForeignImport = struct {
@@ -321,6 +381,95 @@ pub const Image = struct {
 
     pub fn importIterator(self: Image) ImportIterator {
         return .{ .inner = .{ .bytes = self.imports, .remaining = self.import_count } };
+    }
+};
+
+/// A parsed VIG64 object. The slices point into the source bytes, as they do
+/// for `Image`, but all section offsets and counts are u64.
+pub const Vig64Image = struct {
+    flags: Flags,
+    import_count: u8,
+    symbol_count: u64,
+    relocation_count: u64,
+    imports: []const u8,
+    symbol_records: []const u8,
+    relocation_records: []const u8,
+    strings: []const u8,
+    code: []const u8,
+    data: []const u8,
+    bss_len: u64,
+
+    pub fn sectionLens(self: Vig64Image) [4]u64 {
+        return .{ 0, self.code.len, self.data.len, self.bss_len };
+    }
+
+    pub fn importIterator(self: Vig64Image) container.Vig64ImportIterator {
+        return .{ .bytes = self.imports, .remaining = self.import_count };
+    }
+
+    pub fn symbolIterator(self: Vig64Image) Vig64SymbolIterator {
+        return .{ .records = self.symbol_records, .strings = self.strings, .section_lens = self.sectionLens(), .remaining = self.symbol_count };
+    }
+
+    pub fn relocationIterator(self: Vig64Image) Vig64RelocationIterator {
+        return .{ .records = self.relocation_records, .section_lens = self.sectionLens(), .symbol_count = self.symbol_count, .import_count = self.import_count, .remaining = self.relocation_count };
+    }
+};
+
+pub const Vig64SymbolIterator = struct {
+    records: []const u8,
+    strings: []const u8,
+    section_lens: [4]u64,
+    remaining: u64,
+    offset: usize = 0,
+
+    pub fn next(self: *Vig64SymbolIterator) Error!?Vig64Symbol {
+        if (self.remaining == 0) return null;
+        self.remaining -= 1;
+        if (self.records.len - self.offset < vig64_symbol_record_size) return error.InvalidSymbol;
+        const record = self.records[self.offset..][0..vig64_symbol_record_size];
+        self.offset += vig64_symbol_record_size;
+        const shift = record[24];
+        if (shift > max_alignment_shift) return error.InvalidSymbol;
+        for (record[28..32]) |byte| if (byte != 0) return error.InvalidSymbol;
+        const symbol: Vig64Symbol = .{
+            .name = try readVig64Name(self.strings, std.mem.readInt(u64, record[0..8], .little)),
+            .offset = std.mem.readInt(u64, record[8..16], .little),
+            .size = std.mem.readInt(u64, record[16..24], .little),
+            .alignment = @as(u32, 1) << @intCast(shift),
+            .binding = try Binding.fromByte(record[25]),
+            .kind = try SymbolKind.fromByte(record[26]),
+            .section = try Section.fromByte(record[27]),
+        };
+        try checkVig64Symbol(symbol, self.section_lens);
+        return symbol;
+    }
+};
+
+pub const Vig64RelocationIterator = struct {
+    records: []const u8,
+    section_lens: [4]u64,
+    symbol_count: u64,
+    import_count: u8,
+    remaining: u64,
+    offset: usize = 0,
+
+    pub fn next(self: *Vig64RelocationIterator) Error!?Vig64Relocation {
+        if (self.remaining == 0) return null;
+        self.remaining -= 1;
+        if (self.records.len - self.offset < vig64_relocation_record_size) return error.InvalidRelocation;
+        const record = self.records[self.offset..][0..vig64_relocation_record_size];
+        self.offset += vig64_relocation_record_size;
+        for (record[26..32]) |byte| if (byte != 0) return error.InvalidRelocation;
+        const relocation: Vig64Relocation = .{
+            .offset = std.mem.readInt(u64, record[0..8], .little),
+            .target = std.mem.readInt(u64, record[8..16], .little),
+            .addend = std.mem.readInt(i64, record[16..24], .little),
+            .relocation_type = try Vig64RelocationType.fromByte(record[24]),
+            .section = Section.fromByte(record[25]) catch return error.InvalidRelocation,
+        };
+        try checkVig64Relocation(relocation, self.section_lens, self.symbol_count, self.import_count);
+        return relocation;
     }
 };
 
@@ -418,6 +567,14 @@ fn readName(strings: []const u8, offset: u32) Error![]const u8 {
     return strings[start..][0..len];
 }
 
+fn readVig64Name(strings: []const u8, offset: u64) Error![]const u8 {
+    if (offset > strings.len or strings.len - @as(usize, @intCast(offset)) < 2) return error.InvalidSymbol;
+    const start = @as(usize, @intCast(offset));
+    const len = std.mem.readInt(u16, strings[start..][0..2], .little);
+    if (strings.len - start - 2 < len) return error.InvalidSymbol;
+    return strings[start + 2 ..][0..len];
+}
+
 /// The checks that a symbol must pass, applied both when one is written and
 /// when one is read. Writing an object that this reader would refuse is a fault
 /// in the producer, and it is cheaper to find at the point that made it.
@@ -453,6 +610,23 @@ fn checkSymbol(symbol: Symbol, section_lens: [4]u32) Error!void {
     }
 }
 
+fn checkVig64Symbol(symbol: Vig64Symbol, section_lens: [4]u64) Error!void {
+    switch (symbol.binding) {
+        .local, .global => {
+            if (symbol.section == .none) return error.InvalidSymbol;
+            if (symbol.binding == .global and symbol.name.len == 0) return error.InvalidSymbol;
+            const limit = section_lens[@intFromEnum(symbol.section)];
+            if (symbol.offset > limit or symbol.size > limit - symbol.offset) return error.InvalidSymbol;
+            if (symbol.offset % symbol.alignment != 0) return error.InvalidSymbol;
+        },
+        .undefined, .common => {
+            if (symbol.section != .none or symbol.offset != 0 or symbol.name.len == 0) return error.InvalidSymbol;
+            if (symbol.binding == .common and symbol.size == 0) return error.InvalidSymbol;
+            if (symbol.binding == .undefined and symbol.size != 0) return error.InvalidSymbol;
+        },
+    }
+}
+
 fn checkRelocation(
     relocation: Relocation,
     section_lens: [4]u32,
@@ -479,6 +653,23 @@ fn checkRelocation(
             if (relocation.target >= import_count) return error.InvalidRelocation;
         },
         .code_target32, .data_address32, .guest_address32 => {
+            if (relocation.target >= symbol_count) return error.InvalidRelocation;
+        },
+    }
+}
+
+fn checkVig64Relocation(relocation: Vig64Relocation, section_lens: [4]u64, symbol_count: u64, import_count: u8) Error!void {
+    const limit = switch (relocation.section) {
+        .code, .data => section_lens[@intFromEnum(relocation.section)],
+        .bss, .none => return error.InvalidRelocation,
+    };
+    const width = relocation.width();
+    if (relocation.offset > limit or limit - relocation.offset < width) return error.InvalidRelocation;
+    switch (relocation.relocation_type) {
+        .foreign_import8 => {
+            if (relocation.addend != 0 or relocation.target >= import_count) return error.InvalidRelocation;
+        },
+        .code_target64, .data_address64, .guest_address64 => {
             if (relocation.target >= symbol_count) return error.InvalidRelocation;
         },
     }
@@ -556,6 +747,47 @@ pub fn parse(bytes: []const u8) Error!Image {
     };
 }
 
+/// Parse a version 2 VIG64 object. VIG32 parsing remains separate so a linker
+/// cannot accidentally mix its 32-bit relocations with these wide records.
+pub fn parseVig64(bytes: []const u8) Error!Vig64Image {
+    if (bytes.len < vig64_header_size) return error.InvalidObjectHeader;
+    if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidObjectHeader;
+    if (bytes[offset_version] != vig64_version) return error.UnsupportedObjectVersion;
+    if (bytes[offset_reserved] != 0) return error.InvalidObjectHeader;
+
+    const flags = try Flags.fromByte(bytes[offset_flags]);
+    const import_count = bytes[offset_import_count];
+    if (import_count > foreign.max_imports) return error.TooManyForeignImports;
+    const code_len = std.mem.readInt(u64, bytes[8..16], .little);
+    const data_len = std.mem.readInt(u64, bytes[16..24], .little);
+    const bss_len = std.mem.readInt(u64, bytes[24..32], .little);
+    const import_table_len = std.mem.readInt(u64, bytes[32..40], .little);
+    const symbol_count = std.mem.readInt(u64, bytes[40..48], .little);
+    const relocation_count = std.mem.readInt(u64, bytes[48..56], .little);
+    const string_table_len = std.mem.readInt(u64, bytes[56..64], .little);
+    const symbol_bytes = @as(u128, symbol_count) * vig64_symbol_record_size;
+    const relocation_bytes = @as(u128, relocation_count) * vig64_relocation_record_size;
+    const declared = @as(u128, vig64_header_size) + import_table_len + symbol_bytes + relocation_bytes + string_table_len + code_len + data_len;
+    if (declared != bytes.len) return error.ObjectSizeMismatch;
+    if (import_table_len > std.math.maxInt(usize) or symbol_bytes > std.math.maxInt(usize) or relocation_bytes > std.math.maxInt(usize) or string_table_len > std.math.maxInt(usize) or code_len > std.math.maxInt(usize) or data_len > std.math.maxInt(usize)) return error.ObjectSizeMismatch;
+
+    var cursor: usize = vig64_header_size;
+    const imports = bytes[cursor..][0..@intCast(import_table_len)];
+    cursor += imports.len;
+    const symbol_records = bytes[cursor..][0..@intCast(symbol_bytes)];
+    cursor += symbol_records.len;
+    const relocation_records = bytes[cursor..][0..@intCast(relocation_bytes)];
+    cursor += relocation_records.len;
+    const strings = bytes[cursor..][0..@intCast(string_table_len)];
+    cursor += strings.len;
+    const code = bytes[cursor..][0..@intCast(code_len)];
+    cursor += code.len;
+    const data = bytes[cursor..][0..@intCast(data_len)];
+    if (try container.vig64ImportTableSize(imports, import_count) != imports.len) return error.ObjectSizeMismatch;
+
+    return .{ .flags = flags, .import_count = import_count, .symbol_count = symbol_count, .relocation_count = relocation_count, .imports = imports, .symbol_records = symbol_records, .relocation_records = relocation_records, .strings = strings, .code = code, .data = data, .bss_len = bss_len };
+}
+
 /// The data for `write`. A symbol's name is written into the string table in
 /// the order the symbols appear, so a relocation's `target` is an index into
 /// this same `symbols` slice.
@@ -566,6 +798,16 @@ pub const Layout = struct {
     code: []const u8,
     data: []const u8 = &.{},
     bss_len: u32 = 0,
+    flags: Flags = .{},
+};
+
+pub const Vig64Layout = struct {
+    imports: []const foreign.Vig64Import = &.{},
+    symbols: []const Vig64Symbol = &.{},
+    relocations: []const Vig64Relocation = &.{},
+    code: []const u8,
+    data: []const u8 = &.{},
+    bss_len: u64 = 0,
     flags: Flags = .{},
 };
 
@@ -625,6 +867,32 @@ fn measure(layout: Layout) Error!Sizes {
 /// The exact size of the file that `write` makes for `layout`.
 pub fn encodedSize(layout: Layout) Error!usize {
     return (try measure(layout)).total;
+}
+
+pub fn encodedVig64Size(layout: Vig64Layout) Error!usize {
+    return (try measureVig64(layout)).total;
+}
+
+const Vig64Sizes = struct { imports: u64, strings: u64, total: usize };
+
+fn measureVig64(layout: Vig64Layout) Error!Vig64Sizes {
+    const imports = try container.vig64ImportTableLen(layout.imports);
+    const section_lens: [4]u64 = .{ 0, layout.code.len, layout.data.len, layout.bss_len };
+    var strings: u64 = 0;
+    for (layout.symbols) |symbol| {
+        if (symbol.name.len > std.math.maxInt(u16)) return error.NameTooLong;
+        _ = try alignmentShift(symbol.alignment);
+        try checkVig64Symbol(symbol, section_lens);
+        strings += 2 + symbol.name.len;
+    }
+    for (layout.relocations) |relocation| {
+        try checkVig64Relocation(relocation, section_lens, layout.symbols.len, @intCast(layout.imports.len));
+    }
+    const total = @as(u128, vig64_header_size) + imports +
+        @as(u128, layout.symbols.len) * vig64_symbol_record_size +
+        @as(u128, layout.relocations.len) * vig64_relocation_record_size + strings + layout.code.len + layout.data.len;
+    const total_usize = std.math.cast(usize, total) orelse return error.ObjectSizeMismatch;
+    return .{ .imports = imports, .strings = strings, .total = total_usize };
 }
 
 /// Write a complete object into `dest`. The function gives the number of bytes
@@ -690,6 +958,64 @@ pub fn write(layout: Layout, dest: []u8) Error!usize {
     return offset + layout.data.len;
 }
 
+/// Write the first VIG64 object form. It contains the V2 header and typed
+/// imports. Wide symbol and relocation records are added before this writer is
+/// exposed through the assembler.
+pub fn writeVig64(layout: Vig64Layout, dest: []u8) Error!usize {
+    const sizes = try measureVig64(layout);
+    const total = sizes.total;
+    if (dest.len < total) return error.BufferTooSmall;
+
+    @memset(dest[0..vig64_header_size], 0);
+    @memcpy(dest[0..magic.len], magic);
+    dest[offset_version] = vig64_version;
+    dest[offset_flags] = layout.flags.toByte();
+    dest[offset_import_count] = @intCast(layout.imports.len);
+    std.mem.writeInt(u64, dest[8..16], @intCast(layout.code.len), .little);
+    std.mem.writeInt(u64, dest[16..24], @intCast(layout.data.len), .little);
+    std.mem.writeInt(u64, dest[24..32], layout.bss_len, .little);
+    std.mem.writeInt(u64, dest[32..40], sizes.imports, .little);
+    std.mem.writeInt(u64, dest[40..48], layout.symbols.len, .little);
+    std.mem.writeInt(u64, dest[48..56], layout.relocations.len, .little);
+    std.mem.writeInt(u64, dest[56..64], sizes.strings, .little);
+
+    var offset = vig64_header_size + container.writeVig64ImportTable(layout.imports, dest[vig64_header_size..]);
+    var name_offset: u64 = 0;
+    for (layout.symbols) |symbol| {
+        const record = dest[offset..][0..vig64_symbol_record_size];
+        @memset(record, 0);
+        std.mem.writeInt(u64, record[0..8], name_offset, .little);
+        std.mem.writeInt(u64, record[8..16], symbol.offset, .little);
+        std.mem.writeInt(u64, record[16..24], symbol.size, .little);
+        record[24] = try alignmentShift(symbol.alignment);
+        record[25] = @intFromEnum(symbol.binding);
+        record[26] = @intFromEnum(symbol.kind);
+        record[27] = @intFromEnum(symbol.section);
+        offset += vig64_symbol_record_size;
+        name_offset += 2 + symbol.name.len;
+    }
+    for (layout.relocations) |relocation| {
+        const record = dest[offset..][0..vig64_relocation_record_size];
+        @memset(record, 0);
+        std.mem.writeInt(u64, record[0..8], relocation.offset, .little);
+        std.mem.writeInt(u64, record[8..16], relocation.target, .little);
+        std.mem.writeInt(i64, record[16..24], relocation.addend, .little);
+        record[24] = @intFromEnum(relocation.relocation_type);
+        record[25] = @intFromEnum(relocation.section);
+        offset += vig64_relocation_record_size;
+    }
+    for (layout.symbols) |symbol| {
+        std.mem.writeInt(u16, dest[offset..][0..2], @intCast(symbol.name.len), .little);
+        offset += 2;
+        @memcpy(dest[offset..][0..symbol.name.len], symbol.name);
+        offset += symbol.name.len;
+    }
+    @memcpy(dest[offset..][0..layout.code.len], layout.code);
+    offset += layout.code.len;
+    @memcpy(dest[offset..][0..layout.data.len], layout.data);
+    return offset + layout.data.len;
+}
+
 // Tests ----------------------------------------------------------------------
 
 const testing = std.testing;
@@ -706,6 +1032,36 @@ const sample_data = "hi\x00\x00";
 
 fn sampleLayout() Layout {
     return .{ .code = &sample_code, .data = sample_data, .bss_len = 8 };
+}
+
+test "a VIG64 object round-trips the wide header and imports" {
+    var import: foreign.Vig64Import = .{ .library = "kernel32.dll", .symbol = "CreateFileA", .result = .host_ptr };
+    for ([_]foreign.Vig64Type{ .guest_ptr, .u32, .u32, .host_ptr, .u32, .u32, .host_ptr }) |arg_type| {
+        try import.addArg(arg_type);
+    }
+    const code = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const symbols = [_]Vig64Symbol{
+        .{ .name = "entry", .binding = .global, .kind = .function, .section = .code },
+        .{ .name = "large", .binding = .common, .kind = .object, .section = .none, .size = @as(u64, 1) << 32, .alignment = 8 },
+    };
+    const relocations = [_]Vig64Relocation{.{ .relocation_type = .guest_address64, .section = .code, .offset = 1, .target = 1 }};
+    const layout: Vig64Layout = .{ .imports = &.{import}, .symbols = &symbols, .relocations = &relocations, .code = &code, .data = "x\x00", .bss_len = @as(u64, 1) << 32 };
+    var bytes: [256]u8 = undefined;
+    const written = try writeVig64(layout, &bytes);
+    const image = try parseVig64(bytes[0..written]);
+    try testing.expectEqual(@as(u64, 1) << 32, image.bss_len);
+    try testing.expectEqual(@as(u64, 2), image.symbol_count);
+    try testing.expectEqual(@as(u64, 1), image.relocation_count);
+    try testing.expectEqualSlices(u8, &code, image.code);
+    var iterator = image.importIterator();
+    const decoded = (try iterator.next()).?;
+    try testing.expectEqual(foreign.Vig64ResultType.host_ptr, decoded.result);
+    try testing.expectEqual(@as(usize, 7), decoded.argTypes().len);
+    var symbols_it = image.symbolIterator();
+    try testing.expectEqualStrings("entry", (try symbols_it.next()).?.name);
+    try testing.expectEqual(@as(u64, 1) << 32, (try symbols_it.next()).?.size);
+    var relocations_it = image.relocationIterator();
+    try testing.expectEqual(Vig64RelocationType.guest_address64, (try relocations_it.next()).?.relocation_type);
 }
 
 test "an object round-trips every kind of symbol, relocation and import" {

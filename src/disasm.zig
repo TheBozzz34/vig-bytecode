@@ -50,7 +50,9 @@ pub fn writeInstruction(
     switch (instruction.operand) {
         .none => {},
         .signed => |value| try writer.print(" {d}", .{value}),
+        .signed64 => |value| try writer.print(" {d}", .{value}),
         .data_address, .code_target => |address| try writer.print(" {d}", .{address}),
+        .data_address64, .code_target64 => |address| try writer.print(" {d}", .{address}),
         .local_index => |index| try writer.print(" {d}", .{index}),
         .frame_shape => |shape| try writer.print(" {d} {d}", .{ shape.arguments, shape.locals }),
         .import_index => |index| {

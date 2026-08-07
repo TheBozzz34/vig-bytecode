@@ -16,6 +16,7 @@
 //! - `verify` checks instruction boundaries and control flow.
 //! - `disasm` writes the bytes of a program as text a person can read.
 
+pub const abi = @import("abi.zig");
 pub const container = @import("container.zig");
 pub const disasm = @import("disasm.zig");
 pub const encode = @import("encode.zig");

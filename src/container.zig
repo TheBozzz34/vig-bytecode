@@ -54,12 +54,17 @@
 //! can check them.
 
 const std = @import("std");
+const abi = @import("abi.zig");
 const foreign = @import("foreign.zig");
 
 pub const magic = "VIGF";
 
-/// The format version that this package writes.
-pub const version: u8 = 3;
+/// The numbered container versions for the two execution ABIs.
+pub const vig32_version: u8 = abi.Profile.vig32.containerVersion();
+pub const vig64_version: u8 = abi.Profile.vig64.containerVersion();
+/// The format version that this package writes until every producer can emit
+/// the wider VIG64 header.
+pub const version: u8 = vig32_version;
 /// The version before this one. Its `load` and `store` operands index a segment of
 /// i32 slots, so a VM must refuse it rather than read those operands as addresses.
 pub const slot_addressed_version: u8 = 2;
@@ -67,7 +72,17 @@ pub const slot_addressed_version: u8 = 2;
 /// the imports and one region that holds both the code and the data.
 pub const legacy_version: u8 = 1;
 
+/// Find the execution ABI that a numbered current container selects. Older
+/// formats have different memory semantics and deliberately return null.
+pub fn profileForVersion(file_version: u8) ?abi.Profile {
+    return abi.Profile.fromContainerVersion(file_version);
+}
+
 pub const header_size = 28;
+/// The VIG64 header keeps the same prefix, then uses five little-endian u64
+/// fields: code length, data length, entry point, import-table length, and BSS
+/// length.
+pub const vig64_header_size = 48;
 /// The size of a version 2 header. This package reads such a header so a tool can
 /// report what an old file holds.
 pub const slot_addressed_header_size = 24;
@@ -308,6 +323,30 @@ pub fn parse(bytes: []const u8) Error!Image {
     };
 }
 
+/// Parse only a VIG64 container. `parse` intentionally continues to reject
+/// this version until the VM selects its VIG64 execution path.
+pub fn parseVig64(bytes: []const u8) Error!Vig64Image {
+    const header = try readVig64Header(bytes);
+    const declared = @as(u128, vig64_header_size) + header.import_table_len + header.code_len + header.data_len;
+    if (declared != bytes.len) return error.ContainerSizeMismatch;
+    if (header.code_len > std.math.maxInt(usize) or header.data_len > std.math.maxInt(usize)) {
+        return error.ContainerSizeMismatch;
+    }
+
+    const import_end_u64 = @as(u64, vig64_header_size) + header.import_table_len;
+    if (import_end_u64 > std.math.maxInt(usize)) return error.ContainerSizeMismatch;
+    const code_start: usize = @intCast(import_end_u64);
+    const code_end_u64 = import_end_u64 + header.code_len;
+    if (code_end_u64 > std.math.maxInt(usize)) return error.ContainerSizeMismatch;
+    const code_end: usize = @intCast(code_end_u64);
+    const imports = bytes[vig64_header_size..code_start];
+    if (try vig64ImportTableSize(imports, header.import_count) != imports.len) {
+        return error.ContainerSizeMismatch;
+    }
+    try checkVig64EntryPoint(header.entry_point, header.code_len);
+    return .{ .header = header, .imports = imports, .code = bytes[code_start..code_end], .data = bytes[code_end..] };
+}
+
 fn parseLegacy(bytes: []const u8) Error!Image {
     if (bytes.len < legacy_header_size) return error.InvalidContainerHeader;
 
@@ -353,6 +392,53 @@ pub fn importTableSize(bytes: []const u8, count: u8) Error!usize {
     return iterator.offset;
 }
 
+fn checkVig64EntryPoint(entry_point: u64, code_len: u64) Error!void {
+    if (code_len == 0) {
+        if (entry_point != 0) return error.EntryPointOutOfRange;
+        return;
+    }
+    if (entry_point >= code_len) return error.EntryPointOutOfRange;
+}
+
+pub fn writeVig64Header(header: Vig64Header, dest: *[vig64_header_size]u8) void {
+    @memcpy(dest[0..magic.len], magic);
+    dest[offset_version] = vig64_version;
+    dest[offset_flags] = header.flags.toByte();
+    dest[offset_import_count] = header.import_count;
+    dest[offset_reserved] = 0;
+    std.mem.writeInt(u64, dest[8..16], header.code_len, .little);
+    std.mem.writeInt(u64, dest[16..24], header.data_len, .little);
+    std.mem.writeInt(u64, dest[24..32], header.entry_point, .little);
+    std.mem.writeInt(u64, dest[32..40], header.import_table_len, .little);
+    std.mem.writeInt(u64, dest[40..48], header.bss_len, .little);
+}
+
+pub fn readVig64Header(bytes: []const u8) Error!Vig64Header {
+    if (!isContainer(bytes) or bytes.len < vig64_header_size) return error.InvalidContainerHeader;
+    if (bytes[offset_version] != vig64_version) return error.UnsupportedContainerVersion;
+    if (bytes[offset_reserved] != 0) return error.InvalidContainerHeader;
+    const import_count = bytes[offset_import_count];
+    if (import_count > foreign.max_imports) return error.TooManyForeignImports;
+
+    return .{
+        .format_version = vig64_version,
+        .flags = try Flags.fromByte(bytes[offset_flags]),
+        .import_count = import_count,
+        .code_len = std.mem.readInt(u64, bytes[8..16], .little),
+        .data_len = std.mem.readInt(u64, bytes[16..24], .little),
+        .entry_point = std.mem.readInt(u64, bytes[24..32], .little),
+        .import_table_len = std.mem.readInt(u64, bytes[32..40], .little),
+        .bss_len = std.mem.readInt(u64, bytes[40..48], .little),
+    };
+}
+
+/// The number of bytes that the first `count` VIG64 import entries use.
+pub fn vig64ImportTableSize(bytes: []const u8, count: u8) Error!usize {
+    var iterator: Vig64ImportIterator = .{ .bytes = bytes, .remaining = count };
+    while (try iterator.next()) |_| {}
+    return iterator.offset;
+}
+
 pub const ImportIterator = struct {
     bytes: []const u8,
     offset: usize = 0,
@@ -387,6 +473,73 @@ pub const ImportIterator = struct {
     }
 };
 
+pub const Vig64Header = struct {
+    format_version: u8 = vig64_version,
+    flags: Flags = .{},
+    import_count: u8 = 0,
+    code_len: u64 = 0,
+    data_len: u64 = 0,
+    entry_point: u64 = 0,
+    import_table_len: u64 = 0,
+    bss_len: u64 = 0,
+};
+
+/// A parsed VIG64 image. It uses VIG64 imports and lengths, so it is separate
+/// from `Image`, which describes VIG32 and historic container forms.
+pub const Vig64Image = struct {
+    header: Vig64Header,
+    imports: []const u8,
+    code: []const u8,
+    data: []const u8,
+
+    pub fn fileImageLen(self: Vig64Image) u64 {
+        return self.header.code_len + self.header.data_len;
+    }
+
+    pub fn imageLen(self: Vig64Image) u64 {
+        return self.fileImageLen() + self.header.bss_len;
+    }
+
+    pub fn importIterator(self: Vig64Image) Vig64ImportIterator {
+        return .{ .bytes = self.imports, .remaining = self.header.import_count };
+    }
+};
+
+/// VIG64 stores a result-type byte between the argument count and its argument
+/// type bytes. Its record is intentionally not compatible with a VIG32 record.
+pub const Vig64ImportIterator = struct {
+    bytes: []const u8,
+    offset: usize = 0,
+    remaining: u8,
+
+    pub fn next(self: *Vig64ImportIterator) Error!?foreign.Vig64Import {
+        if (self.remaining == 0) return null;
+        self.remaining -= 1;
+        if (self.bytes.len - self.offset < 4) return error.InvalidContainerHeader;
+
+        const library_len: usize = self.bytes[self.offset];
+        const symbol_len: usize = self.bytes[self.offset + 1];
+        const arg_count: usize = self.bytes[self.offset + 2];
+        const result = try foreign.Vig64ResultType.fromByte(self.bytes[self.offset + 3]);
+        self.offset += 4;
+        if (arg_count > foreign.vig64_max_args) return error.TooManyForeignArguments;
+        if (self.bytes.len - self.offset < arg_count) return error.InvalidContainerHeader;
+
+        var import: foreign.Vig64Import = .{ .library = "", .symbol = "", .result = result };
+        for (self.bytes[self.offset..][0..arg_count]) |byte| {
+            try import.addArg(try foreign.Vig64Type.fromByte(byte));
+        }
+        self.offset += arg_count;
+
+        const names_len = library_len + symbol_len;
+        if (self.bytes.len - self.offset < names_len) return error.InvalidContainerHeader;
+        import.library = self.bytes[self.offset..][0..library_len];
+        import.symbol = self.bytes[self.offset + library_len ..][0..symbol_len];
+        self.offset += names_len;
+        return import;
+    }
+};
+
 /// The data for `write`. `code` and `data` are regions that the assembler made
 /// before. An address in the program refers to the two regions as one continuous
 /// image.
@@ -401,9 +554,24 @@ pub const Layout = struct {
     flags: Flags = .{},
 };
 
+pub const Vig64Layout = struct {
+    imports: []const foreign.Vig64Import = &.{},
+    code: []const u8,
+    data: []const u8 = &.{},
+    bss_len: u64 = 0,
+    entry_point: u64 = 0,
+    flags: Flags = .{},
+};
+
 /// The exact size of the file that `write` makes for `layout`.
 pub fn encodedSize(layout: Layout) Error!usize {
     return header_size + try importTableLen(layout.imports) + layout.code.len + layout.data.len;
+}
+
+pub fn encodedVig64Size(layout: Vig64Layout) Error!usize {
+    const table_len = try vig64ImportTableLen(layout.imports);
+    const total = @as(u128, vig64_header_size) + table_len + layout.code.len + layout.data.len;
+    return std.math.cast(usize, total) orelse error.ContainerSizeMismatch;
 }
 
 /// Write a complete container into `dest`. The function gives the number of
@@ -433,6 +601,32 @@ pub fn write(layout: Layout, dest: []u8) Error!usize {
     return offset + layout.data.len;
 }
 
+/// Write a complete VIG64 container into `dest`.
+pub fn writeVig64(layout: Vig64Layout, dest: []u8) Error!usize {
+    const table_len = try vig64ImportTableLen(layout.imports);
+    const code_len: u64 = @intCast(layout.code.len);
+    const data_len: u64 = @intCast(layout.data.len);
+    try checkVig64EntryPoint(layout.entry_point, code_len);
+    const total = try encodedVig64Size(layout);
+    if (dest.len < total) return error.BufferTooSmall;
+
+    writeVig64Header(.{
+        .flags = layout.flags,
+        .import_count = @intCast(layout.imports.len),
+        .code_len = code_len,
+        .data_len = data_len,
+        .entry_point = layout.entry_point,
+        .import_table_len = table_len,
+        .bss_len = layout.bss_len,
+    }, dest[0..vig64_header_size]);
+
+    var offset = vig64_header_size + writeVig64ImportTable(layout.imports, dest[vig64_header_size..]);
+    @memcpy(dest[offset..][0..layout.code.len], layout.code);
+    offset += layout.code.len;
+    @memcpy(dest[offset..][0..layout.data.len], layout.data);
+    return offset + layout.data.len;
+}
+
 /// Write the import table alone, without a header around it, and give the number
 /// of bytes written. `dest` must hold `importTableLen(imports)` bytes or more.
 ///
@@ -445,6 +639,28 @@ pub fn writeImportTable(imports: []const foreign.Import, dest: []u8) usize {
         dest[offset + 1] = @intCast(import.symbol.len);
         dest[offset + 2] = import.arg_count;
         offset += 3;
+        for (import.argTypes()) |arg_type| {
+            dest[offset] = @intFromEnum(arg_type);
+            offset += 1;
+        }
+        @memcpy(dest[offset..][0..import.library.len], import.library);
+        offset += import.library.len;
+        @memcpy(dest[offset..][0..import.symbol.len], import.symbol);
+        offset += import.symbol.len;
+    }
+    return offset;
+}
+
+/// Write a VIG64 import table. The result type makes this table a different
+/// format from the VIG32 table above.
+pub fn writeVig64ImportTable(imports: []const foreign.Vig64Import, dest: []u8) usize {
+    var offset: usize = 0;
+    for (imports) |import| {
+        dest[offset] = @intCast(import.library.len);
+        dest[offset + 1] = @intCast(import.symbol.len);
+        dest[offset + 2] = import.arg_count;
+        dest[offset + 3] = @intFromEnum(import.result);
+        offset += 4;
         for (import.argTypes()) |arg_type| {
             dest[offset] = @intFromEnum(arg_type);
             offset += 1;
@@ -515,6 +731,72 @@ test "a container round-trips code, static data, imports and the entry point" {
     try testing.expectEqualStrings("MessageBoxA", decoded.symbol);
     try testing.expectEqualSlices(foreign.ArgType, &.{ .ptr, .cstr, .u32 }, decoded.argTypes());
     try testing.expectEqual(@as(?foreign.Import, null), try iterator.next());
+}
+
+pub fn vig64ImportTableLen(imports: []const foreign.Vig64Import) Error!u64 {
+    if (imports.len > foreign.max_imports) return error.TooManyForeignImports;
+    var total: u64 = 0;
+    for (imports) |import| {
+        if (import.library.len > foreign.max_name_len or import.symbol.len > foreign.max_name_len) {
+            return error.ForeignNameTooLong;
+        }
+        if (import.arg_count > foreign.vig64_max_args) return error.TooManyForeignArguments;
+        total += import.encodedSize();
+    }
+    return total;
+}
+
+test "the numbered current containers select an explicit ABI profile" {
+    try testing.expectEqual(abi.Profile.vig32, profileForVersion(vig32_version).?);
+    try testing.expectEqual(abi.Profile.vig64, profileForVersion(vig64_version).?);
+    try testing.expect(profileForVersion(slot_addressed_version) == null);
+}
+
+test "a VIG64 import table carries a result type and seven arguments" {
+    var import: foreign.Vig64Import = .{
+        .library = "kernel32.dll",
+        .symbol = "CreateFileA",
+        .result = .host_ptr,
+    };
+    for ([_]foreign.Vig64Type{ .guest_ptr, .u32, .u32, .host_ptr, .u32, .u32, .host_ptr }) |arg_type| {
+        try import.addArg(arg_type);
+    }
+
+    const size = try vig64ImportTableLen(&.{import});
+    var bytes: [64]u8 = undefined;
+    try testing.expectEqual(size, writeVig64ImportTable(&.{import}, &bytes));
+    try testing.expectEqual(@as(usize, size), try vig64ImportTableSize(bytes[0..size], 1));
+
+    var iterator: Vig64ImportIterator = .{ .bytes = bytes[0..size], .remaining = 1 };
+    const decoded = (try iterator.next()).?;
+    try testing.expectEqual(foreign.Vig64ResultType.host_ptr, decoded.result);
+    try testing.expectEqualStrings("kernel32.dll", decoded.library);
+    try testing.expectEqualStrings("CreateFileA", decoded.symbol);
+    try testing.expectEqualSlices(foreign.Vig64Type, import.argTypes(), decoded.argTypes());
+    try testing.expectEqual(@as(?foreign.Vig64Import, null), try iterator.next());
+}
+
+test "a VIG64 container round-trips its wide header and typed imports" {
+    var import: foreign.Vig64Import = .{ .library = "kernel32.dll", .symbol = "CreateFileA", .result = .host_ptr };
+    for ([_]foreign.Vig64Type{ .guest_ptr, .u32, .u32, .host_ptr, .u32, .u32, .host_ptr }) |arg_type| {
+        try import.addArg(arg_type);
+    }
+    const code = [_]u8{ @intFromEnum(@import("opcode.zig").OpCode.halt) };
+    const data = "x\x00";
+    const layout: Vig64Layout = .{ .imports = &.{import}, .code = &code, .data = data, .entry_point = 0, .bss_len = 1 << 32 };
+    var bytes: [128]u8 = undefined;
+    const written = try writeVig64(layout, &bytes);
+    try testing.expectEqual(try encodedVig64Size(layout), written);
+    try testing.expectEqual(vig64_header_size + 4 + 7 + 12 + 11 + code.len + data.len, written);
+
+    const image = try parseVig64(bytes[0..written]);
+    try testing.expectEqual(vig64_version, image.header.format_version);
+    try testing.expectEqual(@as(u64, 1) << 32, image.header.bss_len);
+    try testing.expectEqual(@as(u64, 0), image.header.entry_point);
+    try testing.expectEqualSlices(u8, &code, image.code);
+    try testing.expectEqualStrings(data, image.data);
+    try testing.expectEqual(@as(u64, code.len + data.len) + (@as(u64, 1) << 32), image.imageLen());
+    try testing.expectError(error.UnsupportedContainerVersion, parse(bytes[0..written]));
 }
 
 test "the header occupies its documented layout" {
